@@ -121,6 +121,7 @@ func getStopTime(sl *lag_checker.SlaveChecker, bucketNum chan int64, c *conf.Con
 
 	slaveWg.Add(1)
 	go func() {
+		defer slaveWg.Done()
 		for !w.IsFinished && sl != nil {
 			log.StreamLogger.Debug("start to get slave check lag")
 			errSalve = sl.CheckLag()
@@ -131,7 +132,6 @@ func getStopTime(sl *lag_checker.SlaveChecker, bucketNum chan int64, c *conf.Con
 			time.Sleep(800 * time.Millisecond)
 		}
 		log.StreamLogger.Debug("get slave check lag is finished")
-		slaveWg.Done()
 	}()
 
 	for !w.IsFinished {

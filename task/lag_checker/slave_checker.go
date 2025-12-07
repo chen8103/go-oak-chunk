@@ -24,6 +24,11 @@ type slaveInfo struct {
 }
 
 func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, error) {
+	if config.NoSlaves {
+		log.StreamLogger.Debug("NoSlaves is true, skip create SlaveChecker")
+		return nil, nil
+	}
+
 	var (
 		hosts         = make([]mysql.SlaveHost, 0)
 		mysqlClients  = make([]*sql.DB, 0)

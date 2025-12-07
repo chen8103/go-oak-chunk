@@ -27,6 +27,7 @@ var (
 	host                string
 	includeSlaves       string
 	excludeSlaves       string
+	noSlaves            bool
 	//noLogBin            bool
 
 	user          string
@@ -77,6 +78,7 @@ var runCmd = &cobra.Command{
 				MaxLag:        maxLag,
 				IncludeSlaves: includeSlaves,
 				ExcludeSlaves: excludeSlaves,
+				NoSlaves:      noSlaves,
 				//SkipLockTables: skipLockTables,
 				Database:      database,
 				Debug:         debug,
@@ -132,6 +134,7 @@ func initRun() {
 	runCmd.Flags().StringVarP(&password, "password", "p", "", "MySQL password")
 	runCmd.Flags().StringVar(&includeSlaves, "include-slaves", "", "which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.\nex: ip or ip1,ip2,... without port")
 	runCmd.Flags().StringVar(&excludeSlaves, "exclude-slaves", "", "which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.\nex: ip or ip1,ip2,... without port")
+	runCmd.Flags().BoolVar(&noSlaves, "no-slaves", false, "If true: don't calculate lags on slaves")
 	//runCmd.Flags().BoolVar(&noLogBin, "no-log-bin", false, "Do not log to binary log (actions will not replicate). This may be useful if the slave already finds it hard to replicate behind master. The utility may be spawned manually on slave machines, therefore utilizing more than one CPU core on those machines, making replication process faster due to parallelism.")
 	runCmd.Flags().BoolVar(&printProgress, "print-progress", false, "Show number of affected rows during utility runtime")
 	runCmd.Flags().Int64Var(&sleep, "sleep", 0, "Number of milliseconds to sleep between chunks.")

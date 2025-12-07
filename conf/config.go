@@ -26,6 +26,7 @@ type Config struct {
 	MaxLag              int64  `toml:"max_lag"`
 	IncludeSlaves       string `toml:"include_slaves"`
 	ExcludeSlaves       string `toml:"exclude_slaves"`
+	NoSlaves            bool   `toml:"no_slaves"`
 
 	//SkipLockTables      bool   `toml:"skip_lock_tables"`
 	Database string `toml:"database"`

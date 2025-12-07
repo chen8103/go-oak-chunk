@@ -255,9 +255,10 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
 	var tableMeta string
-	rows, err := w.MysqlClient.Query(fmt.Sprintf(vars.TableInfoSQL, w.Database+"."+w.Table))
+	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
+	rows, err := w.MysqlClient.Query(fmt.Sprintf(vars.TableInfoSQL, ns))
 	if err != nil {
-		log.StreamLogger.Error("`show create Table %s` got err: %v", w.Database+"."+w.Table, err)
+		log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
 		os.Exit(1)
 	}
 
@@ -265,7 +266,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	cols, err := rows.Columns()
 	if err != nil {
-		log.StreamLogger.Error("`show create Table %s` got err: %v", w.Database+"."+w.Table, err)
+		log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
 		os.Exit(1)
 	}
 
@@ -276,7 +277,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		}
 
 		if err = rows.Scan(scanArgs...); err != nil {
-			log.StreamLogger.Error("`show create Table %s` got err: %v", w.Database+"."+w.Table, err)
+			log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
 			os.Exit(1)
 		}
 		tableMeta = ColumnValue(scanArgs, cols, "Create Table")

@@ -43,6 +43,8 @@ include_slaves = ""
 # which slaves should be excluded, include_slaves and exclude_slaves are mutually exclusive.
 # ex: ip or ip1,ip2,... without port
 exclude_slaves = ""
+# If true: don't calculate lags on slaves
+no_slaves = false
 # don't change this value
 correct = 50
 #---------------------------------------------------------------------------------------------------------------------
