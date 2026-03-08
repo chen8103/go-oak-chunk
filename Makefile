@@ -1,6 +1,6 @@
 BINARY_NAME = goc
 
-VARS_PKG = go-oak-chunk/v2/vars
+VARS_PKG = go-oak-chunk/v3/vars
 
 BUILD_FLAGS  = -X '${VARS_PKG}.AppName=${BINARY_NAME}'
 #BUILD_FLAGS += -X '${VARS_PKG}.AppVersion=$(shell git describe)'

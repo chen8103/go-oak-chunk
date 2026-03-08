@@ -6,7 +6,7 @@ import (
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 
-	"go-oak-chunk/v2/vars"
+	"go-oak-chunk/v3/vars"
 )
 
 var versionCmd = &cobra.Command{

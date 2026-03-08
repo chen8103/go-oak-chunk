@@ -6,7 +6,7 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"go-oak-chunk/v2/conf"
+	"go-oak-chunk/v3/conf"
 )
 
 func NewMysqlClient(t *conf.Config) (*sql.DB, error) {

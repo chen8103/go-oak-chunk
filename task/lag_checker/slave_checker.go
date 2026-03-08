@@ -5,10 +5,10 @@ import (
 	"strconv"
 	"strings"
 
-	"go-oak-chunk/v2/conf"
-	"go-oak-chunk/v2/log"
-	"go-oak-chunk/v2/mysql"
-	"go-oak-chunk/v2/utils/string_utils"
+	"go-oak-chunk/v3/conf"
+	"go-oak-chunk/v3/log"
+	"go-oak-chunk/v3/mysql"
+	"go-oak-chunk/v3/utils/string_utils"
 )
 
 type SlaveChecker struct {

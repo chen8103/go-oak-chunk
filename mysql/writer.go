@@ -16,9 +16,9 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/pingcap/parser/ast"
 
-	"go-oak-chunk/v2/conf"
-	"go-oak-chunk/v2/log"
-	"go-oak-chunk/v2/vars"
+	"go-oak-chunk/v3/conf"
+	"go-oak-chunk/v3/log"
+	"go-oak-chunk/v3/vars"
 )
 
 type Writer struct {

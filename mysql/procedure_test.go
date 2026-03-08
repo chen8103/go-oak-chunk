@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"go-oak-chunk/v2/conf"
+	"go-oak-chunk/v3/conf"
 )
 
 func TestBuildSQL(t *testing.T) {

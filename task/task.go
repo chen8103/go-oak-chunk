@@ -13,11 +13,11 @@ import (
 	"github.com/gdamore/tcell"
 	"github.com/juju/ratelimit"
 
-	"go-oak-chunk/v2/conf"
-	"go-oak-chunk/v2/log"
-	"go-oak-chunk/v2/mysql"
-	"go-oak-chunk/v2/task/lag_checker"
-	"go-oak-chunk/v2/vars"
+	"go-oak-chunk/v3/conf"
+	"go-oak-chunk/v3/log"
+	"go-oak-chunk/v3/mysql"
+	"go-oak-chunk/v3/task/lag_checker"
+	"go-oak-chunk/v3/vars"
 )
 
 func RunTask(config *conf.Config) error {

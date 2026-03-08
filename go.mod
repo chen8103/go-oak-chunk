@@ -1,4 +1,4 @@
-module go-oak-chunk/v2
+module go-oak-chunk/v3
 
 go 1.23
 

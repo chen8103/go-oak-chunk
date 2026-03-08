@@ -8,7 +8,7 @@ import (
 
 	"github.com/fatih/color"
 
-	"go-oak-chunk/v2/conf"
+	"go-oak-chunk/v3/conf"
 )
 
 func TestRunTask(t *testing.T) {

@@ -1,6 +1,6 @@
 package main
 
-import "go-oak-chunk/v2/cmd"
+import "go-oak-chunk/v3/cmd"
 
 func main() {
 	cmd.Execute()

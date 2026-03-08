@@ -6,7 +6,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"go-oak-chunk/v2/vars"
+	"go-oak-chunk/v3/vars"
 )
 
 var rootCmd = &cobra.Command{

@@ -7,8 +7,8 @@ import (
 	"github.com/pelletier/go-toml"
 	"github.com/realcp1018/tinylog"
 
-	"go-oak-chunk/v2/log"
-	"go-oak-chunk/v2/vars"
+	"go-oak-chunk/v3/log"
+	"go-oak-chunk/v3/vars"
 )
 
 type Config struct {

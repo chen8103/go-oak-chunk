@@ -3,8 +3,8 @@ package lag_checker
 import (
 	"testing"
 
-	"go-oak-chunk/v2/conf"
-	"go-oak-chunk/v2/mysql"
+	"go-oak-chunk/v3/conf"
+	"go-oak-chunk/v3/mysql"
 )
 
 func Test_SlaveChecker(t *testing.T) {
