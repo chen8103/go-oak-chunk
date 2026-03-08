@@ -1,4 +1,4 @@
-module go-oak-chunk/v3
+module github.com/SisyphusSQ/go-oak-chunk/v3
 
 go 1.23
 
@@ -10,8 +10,10 @@ require (
 	github.com/juju/ratelimit v1.0.2
 	github.com/pelletier/go-toml v1.9.5
 	github.com/pingcap/parser v0.0.0-20210525032559-c37778aff307
-	github.com/realcp1018/tinylog v1.0.4
 	github.com/spf13/cobra v1.6.1
+	github.com/tidwall/gjson v1.7.5
+	go.uber.org/zap v1.17.0
+	gopkg.in/natefinch/lumberjack.v2 v2.0.0
 )
 
 require (
@@ -59,7 +61,6 @@ require (
 	github.com/shiena/ansicolor v0.0.0-20151119151921-a422bbe96644 // indirect
 	github.com/shirou/gopsutil v3.21.2+incompatible // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
-	github.com/tidwall/gjson v1.7.5 // indirect
 	github.com/tidwall/match v1.0.3 // indirect
 	github.com/tidwall/pretty v1.1.0 // indirect
 	github.com/tikv/pd v1.1.0-beta.0.20210323121136-78679e5e209d // indirect
@@ -68,7 +69,6 @@ require (
 	go.etcd.io/etcd v0.5.0-alpha.5.0.20200824191128-ae9734ed278b // indirect
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/multierr v1.7.0 // indirect
-	go.uber.org/zap v1.17.0 // indirect
 	golang.org/x/net v0.0.0-20210316092652-d523dce5a7f4 // indirect
 	golang.org/x/sync v0.0.0-20201020160332-67f06af15bc9 // indirect
 	golang.org/x/sys v0.0.0-20210630005230-0f9fa26af87c // indirect
@@ -76,7 +76,6 @@ require (
 	google.golang.org/genproto v0.0.0-20200224152610-e50cd9704f63 // indirect
 	google.golang.org/grpc v1.27.1 // indirect
 	google.golang.org/protobuf v1.26.0 // indirect
-	gopkg.in/natefinch/lumberjack.v2 v2.0.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	vitess.io/vitess v0.0.0-20200325000816-eda961851d63 // indirect
 )

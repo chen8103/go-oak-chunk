@@ -1,14 +1,15 @@
 package lag_checker
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 	"strings"
 
-	"go-oak-chunk/v3/conf"
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/mysql"
-	"go-oak-chunk/v3/utils/string_utils"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/mysql"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/utils/string_utils"
 )
 
 type SlaveChecker struct {
@@ -24,8 +25,12 @@ type slaveInfo struct {
 }
 
 func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, error) {
+	return NewSlaveCheckerWithContext(context.Background(), masterClient, config)
+}
+
+func NewSlaveCheckerWithContext(ctx context.Context, masterClient *sql.DB, config *conf.Config) (*SlaveChecker, error) {
 	if config.NoSlaves {
-		log.StreamLogger.Debug("NoSlaves is true, skip create SlaveChecker")
+		log.Logger.Debug("NoSlaves is true, skip create SlaveChecker")
 		return nil, nil
 	}
 
@@ -36,15 +41,16 @@ func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, 
 		includeSlaves = strings.Split(config.IncludeSlaves, ",")
 		excludeSlaves = strings.Split(config.ExcludeSlaves, ",")
 	)
-	showSlaveSql, err := getCheckSql(masterClient, "master")
+	showSlaveSql, err := getCheckSql(ctx, masterClient, "master")
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := masterClient.Query(showSlaveSql)
+	rows, err := masterClient.QueryContext(ctx, showSlaveSql)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	for rows.Next() {
 		var h mysql.SlaveHost
@@ -55,9 +61,12 @@ func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, 
 
 		hosts = append(hosts, h)
 	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
 
 	for _, host := range hosts {
-		log.StreamLogger.Debug("slave host: [%s]", host.Host)
+		log.Logger.Debugf("slave host: [%s]", host.Host)
 		if config.IncludeSlaves != "" {
 			if !string_utils.ContainsAny(host.Host, includeSlaves) {
 				continue
@@ -67,17 +76,17 @@ func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, 
 				continue
 			}
 		}
-		log.StreamLogger.Debug("Prepare to check slave lag, host: [%s]", host.Host)
+		log.Logger.Debugf("Prepare to check slave lag, host: [%s]", host.Host)
 
 		client, err := mysql.NewMysqlClientForSlave(config, host.Host)
 		if err != nil {
-			log.StreamLogger.Debug("Slave host can't be created, host: [%s]", host.Host)
+			log.Logger.Debugf("Slave host can't be created, host: [%s]", host.Host)
 			continue
 		}
 
-		lagSql, err := getCheckSql(client, "slave")
+		lagSql, err := getCheckSql(ctx, client, "slave")
 		if err != nil {
-			log.StreamLogger.Debug("Can't get slave lag check sql, host: [%s]", host.Host)
+			log.Logger.Debugf("Can't get slave lag check sql, host: [%s]", host.Host)
 			continue
 		}
 
@@ -96,7 +105,7 @@ func NewSlaveChecker(masterClient *sql.DB, config *conf.Config) (*SlaveChecker, 
 	return slaveChecker, nil
 }
 
-func (s *SlaveChecker) CheckLag() error {
+func (s *SlaveChecker) CheckLag(ctx context.Context) error {
 	var maxLag int64
 	for _, sl := range s.Slaves {
 		if sl.canSkip {
@@ -104,22 +113,22 @@ func (s *SlaveChecker) CheckLag() error {
 		}
 
 		// 默认不是多源同步
-		slaveLag, err := s.getSlaveLag(sl.MysqlClient, sl.lagSql)
+		slaveLag, err := s.getSlaveLag(ctx, sl.MysqlClient, sl.lagSql)
 		if err != nil {
 			// 如果此处取Seconds_Behind_Master报错了。则默认该从库已坏，并将其从延迟检测中摘除
 			sl.canSkip = true
-			log.StreamLogger.Warn("SlaveHost[%s], fetch slave lag got err: %v", sl.host, err)
+			log.Logger.Warnf("SlaveHost[%s], fetch slave lag got err: %v", sl.host, err)
 			continue
 		}
 
-		log.StreamLogger.Debug("SlaveHost[%s], Seconds_Behind_Master: %d", sl.host, slaveLag)
+		log.Logger.Debugf("SlaveHost[%s], Seconds_Behind_Master: %d", sl.host, slaveLag)
 		if slaveLag > maxLag {
 			maxLag = slaveLag
 		}
 	}
 
 	s.MaxLag = maxLag
-	log.StreamLogger.Debug("MaxLag Seconds_Behind_Master: %d", maxLag)
+	log.Logger.Debugf("MaxLag Seconds_Behind_Master: %d", maxLag)
 	return nil
 }
 
@@ -129,11 +138,12 @@ func (s *SlaveChecker) Close() {
 	}
 }
 
-func (s *SlaveChecker) getSlaveLag(client *sql.DB, lagSql string) (slaveLag int64, err error) {
-	slaveStatusRows, err := client.Query(lagSql)
+func (s *SlaveChecker) getSlaveLag(ctx context.Context, client *sql.DB, lagSql string) (slaveLag int64, err error) {
+	slaveStatusRows, err := client.QueryContext(ctx, lagSql)
 	if err != nil {
 		return 0, err
 	}
+	defer slaveStatusRows.Close()
 
 	slaveCols, err := slaveStatusRows.Columns()
 	if err != nil {
@@ -155,14 +165,17 @@ func (s *SlaveChecker) getSlaveLag(client *sql.DB, lagSql string) (slaveLag int6
 			return 0, err
 		}
 	}
+	if err = slaveStatusRows.Err(); err != nil {
+		return 0, err
+	}
 	return slaveLag, nil
 }
 
-func getCheckSql(client *sql.DB, either string) (string, error) {
+func getCheckSql(ctx context.Context, client *sql.DB, either string) (string, error) {
 	// 首先确定MySQL的版本
 	// 8.0.21以下版本用 SHOW SLAVE STATUS
 	// 8.0.22 以及8.1.x 8.2.x ...用 SHOW REPLICA STATUS
-	version, err := mysql.CheckVersion(client)
+	version, err := mysql.CheckVersionContext(ctx, client)
 	if err != nil {
 		return "", err
 	}

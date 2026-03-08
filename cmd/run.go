@@ -12,11 +12,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	oak "go-oak-chunk/v3"
-	"go-oak-chunk/v3/conf"
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/task"
-	"go-oak-chunk/v3/vars"
+	oak "github.com/SisyphusSQ/go-oak-chunk/v3"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/task"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 var (

@@ -1,5 +1,9 @@
 # go-oak-chunk
 
+## 文档导航
+- CLI 使用手册：[`doc/design/cli-usage.md`](doc/design/cli-usage.md)
+- SDK 使用手册：[`doc/design/sdk-usage.md`](doc/design/sdk-usage.md)
+
 ## 背景
 使用`oak-chunk-update`(dml tools)在做dml变更的时候，因其设计原因，必定会扫描全表。导致了在对大表dml的时候，性能非常低。
 

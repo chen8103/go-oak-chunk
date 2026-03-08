@@ -137,7 +137,7 @@ func GetPossibleUniqueKeys(tableNode *ast.CreateTableStmt) []*UnqKeys {
 				isNull := true
 
 				if key.Column.Name.String() != col.Name.Name.String() {
-					//log.StreamLogger.Debug("key: %s <-> col: %s", key.Column.Name.String(), col.Name.String())
+					//log.Logger.Debug("key: %s <-> col: %s", key.Column.Name.String(), col.Name.String())
 					continue
 				}
 				for _, option := range col.Options {

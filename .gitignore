@@ -5,6 +5,8 @@ tags
 coverage.out
 
 .idea
+.vscode
+.cursor
 
 .DS_Store
 

@@ -3,22 +3,22 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"os"
 	"reflect"
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	soar "github.com/XiaoMi/soar/ast"
 	"github.com/juju/ratelimit"
 	"github.com/pingcap/parser/ast"
 
-	"go-oak-chunk/v3/conf"
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/vars"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 type Writer struct {
@@ -27,15 +27,16 @@ type Writer struct {
 	OriginWhereClause string
 	ChunkSize         int64
 	TxnSize           int64
-	IsFinished        bool
 	SqlType           string
-	RowAffects        int64
-	CostTime          time.Duration
 	Database          string
 	Table             string
 	noLogBing         bool
 	unqKeys           *UnqKeys
 	ProducerQueue     chan *Producer
+
+	isFinished    atomic.Bool
+	rowAffects    atomic.Int64
+	costTimeNanos atomic.Int64
 }
 
 type UnqKeys struct {
@@ -59,126 +60,161 @@ type Proceed struct {
 	IsFinished  bool
 }
 
-func NewWriter(c *conf.Config) *Writer {
+func NewWriter(c *conf.Config) (*Writer, error) {
 	w := &Writer{
 		noLogBing:     c.NoLogBin,
 		ChunkSize:     c.ChunkSize,
 		TxnSize:       c.TxnSize,
 		ExecuteSQL:    strings.ReplaceAll(c.ExecuteQuery, ";", ""),
 		ProducerQueue: make(chan *Producer, 1000),
-		IsFinished:    false,
-		CostTime:      1 * time.Second,
 	}
-	w.preCheck(c)
-	return w
+	w.SetCostTime(1 * time.Second)
+
+	if err := w.preCheck(c); err != nil {
+		return nil, err
+	}
+	return w, nil
 }
 
-func (w *Writer) preCheck(c *conf.Config) {
+func (w *Writer) preCheck(c *conf.Config) error {
 	var err error
 
 	// 获取database和table
 	//w.Table = c.Table
 	w.Database = c.Database
 	if w.Database == "" {
-		log.StreamLogger.Error("No Database/Table specified. Specify Table with -t or --Table and Database with -d or --Database")
-		os.Exit(1)
+		return fmt.Errorf("no database specified. specify Database with -d or --database")
 	}
 
 	w.Table, err = TableMetaInfo(w.ExecuteSQL)
 	if err != nil {
-		log.StreamLogger.Error("Table failed. %s", err.Error())
-		os.Exit(1)
+		return fmt.Errorf("failed to parse table info: %w", err)
 	}
 
 	// init mysql connect
 	w.MysqlClient, err = NewMysqlClient(c)
 	if err != nil {
-		log.StreamLogger.Error("open connect is failed, err: %+v", err)
-		os.Exit(1)
+		return fmt.Errorf("open mysql connection failed: %w", err)
 	}
 
-	if !w.tableExists() {
-		log.StreamLogger.Error("Table %s.%s does not exist", w.Database, w.Table)
-		os.Exit(1)
+	exists, err := w.tableExists()
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("table %s.%s does not exist", w.Database, w.Table)
 	}
 
 	err = w.getInfoFromTable(c)
 	if err != nil {
-		log.StreamLogger.Error("sql parser is failed,please check whether sql is correct, err: %+v", err)
-		os.Exit(1)
+		return fmt.Errorf("sql parser failed, please check sql: %w", err)
 	}
+
+	return nil
 }
 
-func (w *Writer) Write(bucket *ratelimit.Bucket, bucketNum chan int64, wg *sync.WaitGroup) error {
+func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum <-chan int64) error {
 	maxRetry := 3
 
 	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
 		// get last bucket number
 		var bucketCount int64
 		for i := 0; i < len(bucketNum); i++ {
-			bucketCount = <-bucketNum
+			select {
+			case bucketCount = <-bucketNum:
+			default:
+			}
 		}
 		if bucketCount == vars.LagThreshold {
-			log.StreamLogger.Debug("Sleep 1s to let slave eliminate lag")
+			log.Logger.Debug("Sleep 1s to let slave eliminate lag")
 			bucket.Wait(1000)
 			continue
 		}
 
-		log.StreamLogger.Debug("bucketCount: %d", bucketCount)
+		log.Logger.Debugf("bucketCount: %d", bucketCount)
 		bucket.Wait(bucketCount)
 
 		var rowAffects int64
 		beginTime := time.Now()
-		tx, err := w.MysqlClient.Begin()
+		tx, err := w.MysqlClient.BeginTx(ctx, nil)
 		if err != nil {
 			return err
 		}
 
-		for pr := range w.ProducerQueue {
-			if pr.IsFinished {
-				log.StreamLogger.Debug("Get whereClause is finished")
-				w.IsFinished = true
+		shouldFinish := false
+	consume:
+		for {
+			if w.TxnSize > 0 && rowAffects >= w.TxnSize {
 				break
+			}
+
+			var pr *Producer
+			select {
+			case <-ctx.Done():
+				_ = tx.Rollback()
+				return nil
+			case pr = <-w.ProducerQueue:
+			}
+			if pr == nil {
+				continue
+			}
+
+			if pr.IsFinished {
+				log.Logger.Debug("Get whereClause is finished")
+				w.SetFinished()
+				shouldFinish = true
+				break consume
 			}
 
 			// 在这里组装完sql和参数后，传到writer中去
 			execSql := w.ExecuteSQL + pr.WhereClause
 			values := getColumnValue(pr.CurrentKeyValues, w.ChunkSize)
 
-			log.StreamLogger.Debug("execSql: %s", execSql)
-			log.StreamLogger.Debug("parma values: %v", values)
+			log.Logger.Debugf("execSql: %s", execSql)
+			log.Logger.Debugf("parma values: %v", values)
 
-			res, errEx := tx.Exec(execSql, values...)
+			res, errEx := tx.ExecContext(ctx, execSql, values...)
 			if errEx != nil {
-				// 重试机制 todo 重写一个方法
-				var errEx2 error
-				for i := 0; i < maxRetry; i++ {
-					tx, errEx2 = w.MysqlClient.Begin()
-					if errEx2 != nil {
-						return errEx2
-					}
-
-					ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					res, errEx2 = tx.ExecContext(ctx, execSql, values...)
-					cancel()
-					if errEx2 != nil {
-						continue
-					} else {
-						break
-					}
+				_ = tx.Rollback()
+				// 在事务里执行过多条语句后再失败，无法安全重放已消费的 chunk，直接失败返回。
+				if rowAffects > 0 {
+					return fmt.Errorf("execute sql failed after %d affected rows in current tx: %w", rowAffects, errEx)
 				}
 
-				if errEx2 != nil {
-					return errEx
+				var retryErr error
+				for i := 0; i < maxRetry; i++ {
+					tx, retryErr = w.MysqlClient.BeginTx(ctx, nil)
+					if retryErr != nil {
+						return retryErr
+					}
+
+					execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					res, retryErr = tx.ExecContext(execCtx, execSql, values...)
+					cancel()
+					if retryErr != nil {
+						_ = tx.Rollback()
+						if errors.Is(retryErr, context.Canceled) || errors.Is(retryErr, context.DeadlineExceeded) {
+							return retryErr
+						}
+						continue
+					}
+					break
+				}
+
+				if retryErr != nil {
+					return fmt.Errorf("execute sql failed after %d retries: %w", maxRetry, retryErr)
 				}
 			}
 
 			// 算一下chunk-size和txn-size之间的关系
 			affects, _ := res.RowsAffected()
 			rowAffects += affects
-			if rowAffects >= w.TxnSize {
-				break
-			}
 		}
 
 		// 速度的控制应该在txnSize
@@ -187,26 +223,24 @@ func (w *Writer) Write(bucket *ratelimit.Bucket, bucketNum chan int64, wg *sync.
 		if err != nil {
 			return err
 		}
-		w.RowAffects += rowAffects
-		w.CostTime = time.Now().Sub(beginTime)
+		w.AddRowAffects(rowAffects)
+		w.SetCostTime(time.Since(beginTime))
 
 		// finish flag
-		if w.IsFinished {
-			log.StreamLogger.Debug("Execute SQL is finished successfully")
-			wg.Done()
+		if shouldFinish || w.IsFinished() {
+			log.Logger.Debug("Execute SQL is finished successfully")
 			return nil
 		}
 	}
 }
 
-func (w *Writer) tableExists() bool {
+func (w *Writer) tableExists() (bool, error) {
 	var count int
 	err := w.MysqlClient.QueryRow(vars.TableExistsSQL, w.Database, w.Table).Scan(&count)
 	if err != nil {
-		log.StreamLogger.Error("tableExists scan failed, err:%v", err)
-		os.Exit(1)
+		return false, fmt.Errorf("tableExists scan failed: %w", err)
 	}
-	return count == 1
+	return count == 1, nil
 }
 
 // getInfoFromTable use tidb parser to build necessary info
@@ -220,8 +254,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	}
 
 	if len(sqlStmt) == 0 || len(sqlStmt) > 1 {
-		log.StreamLogger.Error("SQL is empty? or SQL number is over 1? pls confirm SQL number is only 1")
-		os.Exit(1)
+		return fmt.Errorf("sql is empty or sql number is over 1, please confirm only one sql is provided")
 	}
 
 	node := sqlStmt[0]
@@ -240,14 +273,13 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		sub := re.FindString(c.ExecuteQuery)
 		w.ExecuteSQL = fmt.Sprintf("UPDATE `%s` %s ", w.Table, sub)
 	default:
-		log.StreamLogger.Error("please confirm sql type is `update` or `delete`")
-		os.Exit(1)
+		return fmt.Errorf("please confirm sql type is update or delete")
 	}
 
 	if v.whereClause != "" {
 		// avoid where clause "or", make program confused
 		w.OriginWhereClause = fmt.Sprintf("(%s)", v.whereClause)
-		log.StreamLogger.Debug("originWhereClause: [%s]", v.whereClause)
+		log.Logger.Debugf("originWhereClause: [%s]", v.whereClause)
 
 		w.ExecuteSQL += w.OriginWhereClause
 	}
@@ -258,16 +290,14 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
 	rows, err := w.MysqlClient.Query(fmt.Sprintf(vars.TableInfoSQL, ns))
 	if err != nil {
-		log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
-		os.Exit(1)
+		return fmt.Errorf("show create table %s failed: %w", ns, err)
 	}
 
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
-		os.Exit(1)
+		return fmt.Errorf("show create table %s columns failed: %w", ns, err)
 	}
 
 	for rows.Next() {
@@ -277,10 +307,12 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		}
 
 		if err = rows.Scan(scanArgs...); err != nil {
-			log.StreamLogger.Error("`show create Table %s` got err: %v", ns, err)
-			os.Exit(1)
+			return fmt.Errorf("show create table %s scan failed: %w", ns, err)
 		}
 		tableMeta = ColumnValue(scanArgs, cols, "Create Table")
+	}
+	if err = rows.Err(); err != nil {
+		return fmt.Errorf("show create table %s rows iteration failed: %w", ns, err)
 	}
 
 	tableStmt, err := soar.TiParse(tableMeta, "", "")
@@ -289,17 +321,14 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	}
 
 	uks := make([]*UnqKeys, 0)
-	tableNode := tableStmt[0]
-	switch tableNode.(type) {
+	switch tableNode := tableStmt[0].(type) {
 	case *ast.CreateTableStmt:
-		uks = GetPossibleUniqueKeys(tableNode.(*ast.CreateTableStmt))
+		uks = GetPossibleUniqueKeys(tableNode)
 		if len(uks) == 0 {
-			log.StreamLogger.Error("Can't find any index which is primary or unique key")
-			os.Exit(1)
+			return fmt.Errorf("can't find any index which is primary or unique key")
 		}
 	default:
-		log.StreamLogger.Error("tableMeta is not CreateTableStmt, something goes wrong, tableMeta: %s", tableMeta)
-		os.Exit(1)
+		return fmt.Errorf("table meta is not CreateTableStmt, tableMeta: %s", tableMeta)
 	}
 
 	if c.ForceChunkingColumn != "" {
@@ -316,8 +345,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		}
 
 		// 如果for结束没有数据，说明使用者瞎写的ForceChunkingColumn
-		log.StreamLogger.Error("forced_chunking_column doesn't conform to primary or unique key, ForceChunkingColumn: %s", c.ForceChunkingColumn)
-		os.Exit(1)
+		return fmt.Errorf("forced_chunking_column doesn't conform to primary or unique key, forceChunkingColumn: %s", c.ForceChunkingColumn)
 	}
 
 	for _, uk := range uks {
@@ -331,18 +359,42 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	return nil
 }
 
-func (w *Writer) lockTableRead() {
+func (w *Writer) lockTableRead() error {
 	_, err := w.MysqlClient.Exec(fmt.Sprintf(vars.LockTableSQL, w.Database, w.Table))
 	if err != nil {
-		log.StreamLogger.Error("lockTableRead failed, err:%v", err)
-		os.Exit(1)
+		return fmt.Errorf("lockTableRead failed: %w", err)
 	}
+	return nil
 }
 
-func (w *Writer) unlockTable() {
+func (w *Writer) unlockTable() error {
 	_, err := w.MysqlClient.Exec(vars.UnlockTableSQL)
 	if err != nil {
-		log.StreamLogger.Error("lockTableRead failed, err:%v", err)
-		os.Exit(1)
+		return fmt.Errorf("unlockTable failed: %w", err)
 	}
+	return nil
+}
+
+func (w *Writer) SetFinished() {
+	w.isFinished.Store(true)
+}
+
+func (w *Writer) IsFinished() bool {
+	return w.isFinished.Load()
+}
+
+func (w *Writer) AddRowAffects(delta int64) {
+	w.rowAffects.Add(delta)
+}
+
+func (w *Writer) GetRowAffects() int64 {
+	return w.rowAffects.Load()
+}
+
+func (w *Writer) SetCostTime(cost time.Duration) {
+	w.costTimeNanos.Store(cost.Nanoseconds())
+}
+
+func (w *Writer) GetCostTime() time.Duration {
+	return time.Duration(w.costTimeNanos.Load())
 }

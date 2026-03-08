@@ -5,238 +5,276 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/gdamore/tcell"
-	"github.com/juju/ratelimit"
 
-	"go-oak-chunk/v3/conf"
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/mysql"
-	"go-oak-chunk/v3/task/lag_checker"
-	"go-oak-chunk/v3/vars"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/mysql"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/task/lag_checker"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
+var ErrExecutionStopped = errors.New("execution stopped")
+
+type ProgressSnapshot struct {
+	RowAffects   int64
+	ElapsedTime  time.Duration
+	CurrentSleep int64
+	MaxSlaveLag  int64
+	IsFinished   bool
+}
+
+type ProgressCallback func(status *ProgressSnapshot)
+
+type RunOptions struct {
+	RateLimiter      *RateLimiter
+	ProgressInterval time.Duration
+	ProgressCallback ProgressCallback
+}
+
 func RunTask(config *conf.Config) error {
+	if err := config.PreCheck(); err != nil {
+		return err
+	}
+
+	writer, err := mysql.NewWriter(config)
+	if err != nil {
+		return err
+	}
+
+	opts := RunOptions{}
+	if config.PrintProgress {
+		opts.ProgressInterval = 3 * time.Second
+	}
+
+	return Execute(context.Background(), config, writer, opts)
+}
+
+func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opts RunOptions) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if config == nil {
+		return fmt.Errorf("config is nil")
+	}
+	if writer == nil {
+		return fmt.Errorf("writer is nil")
+	}
+
 	// print json of config
 	configJson, err := json.Marshal(&config)
 	if err == nil {
-		log.StreamLogger.Debug("config json: %s", string(configJson))
+		log.Logger.Debugf("config json: %s", string(configJson))
 	}
 
 	var (
 		wg                    sync.WaitGroup
-		ctx, cancel           = context.WithCancel(context.Background())
-		printProgressDoneChan = make(chan struct{})
+		runCtx, cancel        = context.WithCancel(ctx)
+		deferCancelOnce       sync.Once
+		cleanupOnce           sync.Once
+		printProgressDoneChan = make(chan struct{}, 1)
 		bucketNum             = make(chan int64, 1000)
-		bucket                = ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1)
 	)
+	defer func() {
+		deferCancelOnce.Do(cancel)
+	}()
 
-	// 1. 创建执行SQL的协程
-	// 包含预检查
-	w := mysql.NewWriter(config)
+	rateLimiter := opts.RateLimiter
+	if rateLimiter == nil {
+		rateLimiter = NewRateLimiterFromConfig(config)
+	}
 
-	// 2. 检查是否要创建检查slaveLag的协程
-	// 3. 检查是否要创建检查mysqlio延迟的协程
-	sl, err := lag_checker.NewSlaveChecker(w.MysqlClient, config)
+	progressInterval := opts.ProgressInterval
+	if progressInterval <= 0 {
+		progressInterval = 3 * time.Second
+	}
+
+	sl, err := lag_checker.NewSlaveCheckerWithContext(runCtx, writer.MysqlClient, config)
 	if err != nil {
-		log.StreamLogger.Error("create SlaveChecker goroutine is failed, err: %v", err)
+		log.Logger.Errorf("create SlaveChecker goroutine is failed, err: %v", err)
+		sl = nil
+	}
+
+	cleanup := func() {
+		cleanupOnce.Do(func() {
+			if sl != nil {
+				sl.Close()
+			}
+			if writer.MysqlClient != nil {
+				_ = writer.MysqlClient.Close()
+			}
+		})
 	}
 
 	wg.Add(1)
 	go func() {
-		getStopTime(sl, bucketNum, config, w)
-		log.StreamLogger.Debug("getStopTime goroutine is finished")
-		wg.Done()
+		defer wg.Done()
+		getStopTime(runCtx, sl, bucketNum, rateLimiter, writer)
+		log.Logger.Debug("getStopTime goroutine is finished")
 	}()
 
-	// 4. read
-	readErrChan := make(chan error)
-	p := mysql.NewProcedure(ctx, w)
+	readErrChan := make(chan error, 1)
+	p := mysql.NewProcedure(runCtx, writer)
 	wg.Add(1)
 	go func() {
-		// equals to read goroutine
-		readErrChan <- p.BuildSQL(w.ProducerQueue, &wg)
+		defer wg.Done()
+		readErrChan <- p.BuildSQL(writer.ProducerQueue)
 	}()
 
-	// 5. write
-	writeErrChan := make(chan error)
+	writeErrChan := make(chan error, 1)
 	wg.Add(1)
 	go func() {
-		// write goroutine
-		writeErrChan <- w.Write(bucket, bucketNum, &wg)
+		defer wg.Done()
+		writeErrChan <- writer.Write(runCtx, rateLimiter.Bucket(), bucketNum)
 	}()
 
-	tasksDoneChan := make(chan struct{})
+	tasksDoneChan := make(chan struct{}, 1)
 	go func() {
 		wg.Wait()
 		tasksDoneChan <- struct{}{}
 	}()
 
-	// 6. if verbose
-	if config.PrintProgress {
-		go PrintProgress(config, w, 3*time.Second, ctx, printProgressDoneChan)
+	progressEnabled := false
+	if opts.ProgressCallback != nil {
+		progressEnabled = true
+		go runProgressCallback(runCtx, rateLimiter, writer, progressInterval, opts.ProgressCallback, printProgressDoneChan)
+	} else if config.PrintProgress {
+		progressEnabled = true
+		go PrintProgress(config, writer, progressInterval, runCtx, printProgressDoneChan)
+	}
+
+	waitProgressDone := func() {
+		if progressEnabled {
+			select {
+			case <-printProgressDoneChan:
+			case <-time.After(3 * time.Second):
+				log.Logger.Warn("wait progress callback shutdown timeout")
+			}
+		}
 	}
 
 	for {
 		select {
+		case <-ctx.Done():
+			deferCancelOnce.Do(cancel)
+			cleanup()
+			waitProgressDone()
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return ErrExecutionStopped
+			}
+			return ctx.Err()
 		case readErr := <-readErrChan:
 			if readErr != nil {
-				cancel()
-				Close(sl, w, bucketNum)
+				readErr = normalizeStopError(readErr)
+				deferCancelOnce.Do(cancel)
+				cleanup()
+				waitProgressDone()
 				return readErr
-			} else {
-				continue
 			}
+			readErrChan = nil
 		case writeErr := <-writeErrChan:
 			if writeErr != nil {
-				cancel()
-				Close(sl, w, bucketNum)
+				writeErr = normalizeStopError(writeErr)
+				deferCancelOnce.Do(cancel)
+				cleanup()
+				waitProgressDone()
 				return writeErr
-			} else {
-				continue
 			}
+			writeErrChan = nil
 		case <-tasksDoneChan:
-			// tell PrintProgress to stop
-			cancel()
-			Close(sl, w, bucketNum)
-
-			// confirm PrintProgress stopped
-			if config.PrintProgress {
-				<-printProgressDoneChan
-			}
+			deferCancelOnce.Do(cancel)
+			cleanup()
+			waitProgressDone()
 			return nil
 		}
 	}
 }
 
-func getStopTime(sl *lag_checker.SlaveChecker, bucketNum chan int64, c *conf.Config, w *mysql.Writer) {
-	var (
-		slaveWg  sync.WaitGroup
-		errSalve error
-	)
-
-	slaveWg.Add(1)
-	go func() {
-		defer slaveWg.Done()
-		for !w.IsFinished && sl != nil {
-			log.StreamLogger.Debug("start to get slave check lag")
-			errSalve = sl.CheckLag()
-			if errSalve != nil {
-				log.StreamLogger.Error("slave check lag got err: %v", errSalve)
-				break
-			}
-			time.Sleep(800 * time.Millisecond)
+func getStopTime(ctx context.Context, sl *lag_checker.SlaveChecker, bucketNum chan int64, rateLimiter *RateLimiter, writer *mysql.Writer) {
+	for {
+		select {
+		case <-ctx.Done():
+			log.Logger.Debug("get stop time is finished")
+			return
+		default:
 		}
-		log.StreamLogger.Debug("get slave check lag is finished")
-	}()
 
-	for !w.IsFinished {
-		var token int64
-		if errSalve != nil || sl == nil {
-			token = bucketErrHandle(c)
+		if writer.IsFinished() {
+			log.Logger.Debug("get stop time is finished")
+			return
+		}
+
+		var (
+			token  int64
+			lag    int64
+			lagErr error
+		)
+		if sl != nil {
+			log.Logger.Debug("start to get slave check lag")
+			lagErr = sl.CheckLag(ctx)
+			if lagErr != nil {
+				log.Logger.Errorf("slave check lag got err: %v", lagErr)
+			} else {
+				lag = sl.MaxLag
+			}
+		}
+
+		if sl == nil || lagErr != nil {
+			token = rateLimiter.bucketErrHandle()
 		} else {
-			log.StreamLogger.Debug("sl.MaxLag: %d", sl.MaxLag)
-			if sl.MaxLag >= c.MaxLag && c.MaxLag > 0 {
-				log.StreamLogger.Debug("Reach maxLag Threshold[MaxLag: %d,throttle: %d]", sl.MaxLag, c.MaxLag)
-				c.Correct += 50
-
-				// 增加一个防止chan的容量达到上限的机制 at 2024-03-07
+			rateLimiter.SetCurrentLag(lag)
+			log.Logger.Debugf("sl.MaxLag: %d", lag)
+			if rateLimiter.ShouldThrottle(lag) {
+				log.Logger.Debugf("Reach maxLag Threshold[MaxLag: %d,throttle: %d]", lag, rateLimiter.GetMaxLag())
+				rateLimiter.AddCorrect(50)
 				if len(bucketNum) < 500 {
-					bucketNum <- vars.LagThreshold
+					select {
+					case <-ctx.Done():
+						return
+					case bucketNum <- vars.LagThreshold:
+					default:
+					}
 				}
-				time.Sleep(800 * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(800 * time.Millisecond):
+				}
 				continue
 			}
 
-			token = bucketHandle(sl.MaxLag, c)
+			token = rateLimiter.bucketHandle(lag)
 		}
-		log.StreamLogger.Debug("bucketNum: %d", token+c.Correct)
-		log.StreamLogger.Debug("len of bucketNum: %d", len(bucketNum))
-		log.StreamLogger.Debug("sleep of getStopTime: %d", w.CostTime)
-		// 增加一个防止chan的容量达到上限的机制 at 2024-03-07
+
+		correct := rateLimiter.GetCorrect()
+		log.Logger.Debugf("bucketNum: %d", token+correct)
+		log.Logger.Debugf("len of bucketNum: %d", len(bucketNum))
+		log.Logger.Debugf("sleep of getStopTime: %s", writer.GetCostTime())
+
 		if len(bucketNum) < 500 {
-			bucketNum <- token + c.Correct
-		}
-		// magic number
-		if c.Correct > 300 {
-			c.Correct--
-		}
-		time.Sleep(w.CostTime / 4 * 5)
-	}
-	log.StreamLogger.Debug("get stop time is finished")
-	slaveWg.Wait()
-}
-
-// bucketHandle slaveLag是个非负整数、单位为秒，我们考虑sleep时间的浮动的时候，应该考虑如下几种情况
-// 一、 NotConsiderLag不生效时
-//  1. slaveLag <= c.Sleep 此时，我们应该将bucket tokens和slaveLag进行绑定，说不定不用直接顶满c.Sleep就可以消除主从延迟
-//  2. slaveLag > c.Sleep && slaveLag-c.Sleep > 60*n 则实际等待时间要slaveLag+n
-//
-// 二、 NotConsiderLag生效时
-//
-//	实际等待时间最大为c.Sleep
-//
-// 为了避免逻辑混乱，
-//
-//	使用者在用了sleep参数后，会进行(c.sleep-1000, c.sleep]的sleep时间
-//	如果sleep参数的值小于1s，会进行[0, c.sleep)的sleep时间
-func bucketHandle(lag int64, c *conf.Config) int64 {
-	x := c.Sleep / 1000
-	if lag == 0 && c.Sleep > 0 {
-		if c.Sleep <= 1000 {
-			return rand.Int63n(c.Sleep)
-		}
-		return rand.Int63n(c.Sleep-(c.Sleep-1000)) + (c.Sleep - 1000)
-	} else if lag == 0 && c.Sleep == 0 {
-		return 0
-	} else {
-		if c.NoConsiderLag {
-			if lag <= x {
-				return lag * 1000
-			} else {
-				return c.Sleep
-			}
-		} else {
-			if lag <= x || lag+60 <= x {
-				return lag * 1000
-			} else { // slaveLag > c.Sleep && slaveLag-c.Sleep > 60*n
-				plus := (lag - x) / 60
-				return (x + plus) * 1000
+			select {
+			case <-ctx.Done():
+				return
+			case bucketNum <- token + correct:
+			default:
 			}
 		}
-	}
-}
+		rateLimiter.DecayCorrect(300)
 
-// bucketErrHandle 如果slave检测错误了，就取(c.sleep-1, c.sleep]中的一个随机数
-// 如果卡死一个时间可能会很慢
-func bucketErrHandle(c *conf.Config) int64 {
-	var token int64
-	if c.Sleep != 0 {
-		x := c.Sleep * 1000
-		token = rand.Int63n(x-(x-1000)) + (x - 1000)
-	} else {
-		token = 0
-	}
-	return token
-}
-
-func Close(sl *lag_checker.SlaveChecker, w *mysql.Writer, bucketNum chan int64) {
-	if sl != nil {
-		for _, slave := range sl.Slaves {
-			_ = slave.MysqlClient.Close()
+		sleepTime := writer.GetCostTime() * 5 / 4
+		if sleepTime <= 0 {
+			sleepTime = 100 * time.Millisecond
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(sleepTime):
 		}
 	}
-
-	// wait Procedure.BuildSQL quiet
-	time.Sleep(10 * time.Millisecond)
-
-	w.MysqlClient.Close()
-	close(w.ProducerQueue)
-	close(bucketNum)
 }
 
 // --------PrintProgress----------
@@ -267,20 +305,26 @@ func PrintProgress(config *conf.Config, writer *mysql.Writer, interval time.Dura
 	fmt.Printf("%-23s%-10s%-10s\n", "----", "-------", "----------")
 
 	for {
-		elapsedTime := time.Now().Sub(start)
+		elapsedTime := time.Since(start)
 		e := (int64(elapsedTime.Nanoseconds()) / vars.Billion) * vars.Billion
 		select {
 		case <-ctx.Done():
 			// return when all tasks Done
+			rowAffects := writer.GetRowAffects()
+			speed := 0.0
+			if elapsedTime.Seconds() > 0 {
+				speed = float64(rowAffects) / elapsedTime.Seconds()
+			}
 			color.Green("Total Processed Rows: %d, speed: %.2f rows/s, spend Time: %s\n",
-				writer.RowAffects, float64(writer.RowAffects)/elapsedTime.Seconds(), time.Duration(e).String())
+				rowAffects, speed, time.Duration(e).String())
 			fmt.Println("exiting...")
 			doneChan <- struct{}{}
 			return
 		default:
+			rowAffects := writer.GetRowAffects()
 			fmt.Printf("%-23s", time.Now().Format("2006-01-02 15:04:05"))
 			fmt.Printf("%-10s", time.Duration(e).String())
-			fmt.Printf("%-10d\n", writer.RowAffects)
+			fmt.Printf("%-10d\n", rowAffects)
 			time.Sleep(interval)
 		}
 	}
@@ -289,7 +333,7 @@ func PrintProgress(config *conf.Config, writer *mysql.Writer, interval time.Dura
 func getScreenHeight() (height int, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.GlobalLogger.Error("Recovered from panic in getScreenHeight: %v", r)
+			log.Logger.Errorf("Recovered from panic in getScreenHeight: %v", r)
 			err = errors.New("panic in getScreenHeight")
 		}
 	}()
@@ -306,4 +350,79 @@ func getScreenHeight() (height int, err error) {
 	}
 	_, height = screen.Size()
 	return
+}
+
+func runProgressCallback(
+	ctx context.Context,
+	rateLimiter *RateLimiter,
+	writer *mysql.Writer,
+	interval time.Duration,
+	callback ProgressCallback,
+	doneChan chan struct{},
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Logger.Errorf("recovered panic in runProgressCallback: %v", r)
+		}
+		select {
+		case doneChan <- struct{}{}:
+		default:
+		}
+	}()
+
+	start := time.Now()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	callbackToken := make(chan struct{}, 1)
+	callbackToken <- struct{}{}
+
+	asyncInvoke := func(snapshot *ProgressSnapshot) {
+		select {
+		case <-callbackToken:
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Logger.Errorf("recovered panic in progress callback: %v", r)
+					}
+					callbackToken <- struct{}{}
+				}()
+				callback(snapshot)
+			}()
+		default:
+			log.Logger.Warn("progress callback is still running, skip current tick")
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			asyncInvoke(&ProgressSnapshot{
+				RowAffects:   writer.GetRowAffects(),
+				ElapsedTime:  time.Since(start),
+				CurrentSleep: rateLimiter.GetSleep(),
+				MaxSlaveLag:  rateLimiter.GetCurrentLag(),
+				IsFinished:   writer.IsFinished(),
+			})
+			return
+		case <-ticker.C:
+			asyncInvoke(&ProgressSnapshot{
+				RowAffects:   writer.GetRowAffects(),
+				ElapsedTime:  time.Since(start),
+				CurrentSleep: rateLimiter.GetSleep(),
+				MaxSlaveLag:  rateLimiter.GetCurrentLag(),
+				IsFinished:   writer.IsFinished(),
+			})
+		}
+	}
+}
+
+func normalizeStopError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return ErrExecutionStopped
+	}
+	return err
 }

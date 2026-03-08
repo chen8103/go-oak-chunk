@@ -1,12 +1,13 @@
 package mysql
 
 import (
+	"context"
 	"database/sql"
 	"strconv"
 
 	_ "github.com/go-sql-driver/mysql"
 
-	"go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 )
 
 func NewMysqlClient(t *conf.Config) (*sql.DB, error) {
@@ -34,7 +35,11 @@ func NewMysqlClientForSlave(t *conf.Config, host string) (*sql.DB, error) {
 }
 
 func CheckVersion(client *sql.DB) (version string, err error) {
-	err = client.QueryRow("select @@version").Scan(&version)
+	return CheckVersionContext(context.Background(), client)
+}
+
+func CheckVersionContext(ctx context.Context, client *sql.DB) (version string, err error) {
+	err = client.QueryRowContext(ctx, "select @@version").Scan(&version)
 	if err != nil {
 		return "", err
 	}

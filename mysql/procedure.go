@@ -3,12 +3,12 @@ package mysql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
-	"sync"
 
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/vars"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 type Procedure struct {
@@ -40,15 +40,16 @@ func NewProcedure(ctx context.Context, w *Writer) *Procedure {
 	}
 }
 
-func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error {
+func (p *Procedure) BuildSQL(producer chan *Producer) error {
 	if p.ChunkSize == 0 {
 		pr := &Producer{
 			WhereClause:      "",
 			IsFinished:       true,
 			CurrentKeyValues: make([]*KeyValue, 0),
 		}
-		producer <- pr
-		wg.Done()
+		if !p.enqueueProducer(producer, pr) {
+			return nil
+		}
 		return nil
 	}
 
@@ -84,8 +85,8 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 		execWhere = fmt.Sprintf(" AND (%s AND %s) limit %d", conditions[">="], conditions["<="], p.ChunkSize)
 	}
 
-	log.StreamLogger.Debug("firstSql: [%s]", firstSql)
-	log.StreamLogger.Debug("nextSql: [%s]", nextSql)
+	log.Logger.Debugf("firstSql: [%s]", firstSql)
+	log.Logger.Debugf("nextSql: [%s]", nextSql)
 	// prepare is finished
 	// --------------------------------------
 	// start select index value(s)
@@ -97,7 +98,10 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 			if p.ChunkSize > 1 {
 				keyValues, isFinished, err := p.fetchFistAndLastData(fetchSql)
 				if err != nil {
-					log.StreamLogger.Error("BuildSQL got err: %v", err)
+					if isContextDoneErr(err) {
+						return nil
+					}
+					log.Logger.Errorf("BuildSQL got err: %v", err)
 					return err
 				}
 
@@ -106,9 +110,10 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 					IsFinished:       isFinished,
 					CurrentKeyValues: keyValues,
 				}
-				producer <- pr
+				if !p.enqueueProducer(producer, pr) {
+					return nil
+				}
 				if isFinished {
-					wg.Done()
 					return nil
 				}
 
@@ -116,15 +121,19 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 				selectKeyCols = keyValues[len(keyValues)-len(p.unqKeys.UniqueKeyColumns):]
 				continue
 			} else { // if p.ChunkSize == 1
-				rows, err := p.MysqlClient.Query(fetchSql)
+				rows, err := p.MysqlClient.QueryContext(p.ctx, fetchSql)
 				if err != nil {
-					log.StreamLogger.Error("BuildSQL got err: %v", err)
+					if isContextDoneErr(err) {
+						return nil
+					}
+					log.Logger.Errorf("BuildSQL got err: %v", err)
 					return err
 				}
 
 				cols, err := rows.Columns()
 				if err != nil {
-					log.StreamLogger.Error("BuildSQL got err: %v", err)
+					rows.Close()
+					log.Logger.Errorf("BuildSQL got err: %v", err)
 					return err
 				}
 
@@ -132,7 +141,8 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 				for rows.Next() {
 					keyValues, err = p.getSingleData(cols, rows)
 					if err != nil {
-						log.StreamLogger.Error("BuildSQL got err: %v", err)
+						rows.Close()
+						log.Logger.Errorf("BuildSQL got err: %v", err)
 						return err
 					}
 
@@ -141,18 +151,33 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 						IsFinished:       false,
 						CurrentKeyValues: keyValues,
 					}
-					producer <- pr
+					if !p.enqueueProducer(producer, pr) {
+						rows.Close()
+						return nil
+					}
+				}
+				if err = rows.Err(); err != nil {
+					if isContextDoneErr(err) {
+						rows.Close()
+						return nil
+					}
+					rows.Close()
+					log.Logger.Errorf("BuildSQL got err: %v", err)
+					return err
 				}
 
 				if len(keyValues) == 0 {
-					log.StreamLogger.Debug("fetch index data is finished")
+					log.Logger.Debug("fetch index data is finished")
 					pr := &Producer{
 						WhereClause:      execWhere,
 						IsFinished:       true,
 						CurrentKeyValues: keyValues,
 					}
-					producer <- pr
-					wg.Done()
+					if !p.enqueueProducer(producer, pr) {
+						rows.Close()
+						return nil
+					}
+					rows.Close()
 					return nil
 				}
 
@@ -164,11 +189,14 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 		}
 
 		args := getArgs(selectKeyCols)
-		//log.StreamLogger.Debug("Args values: %v", args)
+		//log.Logger.Debug("Args values: %v", args)
 		if p.ChunkSize > 1 {
 			keyValues, isFinished, err := p.fetchFistAndLastData(fetchSql, args...)
 			if err != nil {
-				log.StreamLogger.Error("BuildSQL got err: %v", err)
+				if isContextDoneErr(err) {
+					return nil
+				}
+				log.Logger.Errorf("BuildSQL got err: %v", err)
 				return err
 			}
 
@@ -177,25 +205,30 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 				IsFinished:       isFinished,
 				CurrentKeyValues: keyValues,
 			}
-			producer <- pr
+			if !p.enqueueProducer(producer, pr) {
+				return nil
+			}
 			if isFinished {
-				wg.Done()
 				return nil
 			}
 
 			selectKeyCols = keyValues[len(keyValues)-len(p.unqKeys.UniqueKeyColumns):]
 		} else {
 			// if p.ChunkSize == 1
-			//log.StreamLogger.Debug("fetchSql: %s", fetchSql)
-			rows, err := p.MysqlClient.Query(fetchSql, args...)
+			//log.Logger.Debug("fetchSql: %s", fetchSql)
+			rows, err := p.MysqlClient.QueryContext(p.ctx, fetchSql, args...)
 			if err != nil {
-				log.StreamLogger.Error("BuildSQL got err: %v", err)
+				if isContextDoneErr(err) {
+					return nil
+				}
+				log.Logger.Errorf("BuildSQL got err: %v", err)
 				return err
 			}
 
 			cols, err := rows.Columns()
 			if err != nil {
-				log.StreamLogger.Error("BuildSQL got err: %v", err)
+				rows.Close()
+				log.Logger.Errorf("BuildSQL got err: %v", err)
 				return err
 			}
 
@@ -203,7 +236,8 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 			for rows.Next() {
 				keyValues, err = p.getSingleData(cols, rows)
 				if err != nil {
-					log.StreamLogger.Error("BuildSQL got err: %v", err)
+					rows.Close()
+					log.Logger.Errorf("BuildSQL got err: %v", err)
 					return err
 				}
 
@@ -212,23 +246,38 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 					IsFinished:       false,
 					CurrentKeyValues: keyValues,
 				}
-				producer <- pr
+				if !p.enqueueProducer(producer, pr) {
+					rows.Close()
+					return nil
+				}
 			}
-			rows.Close()
+			if err = rows.Err(); err != nil {
+				if isContextDoneErr(err) {
+					rows.Close()
+					return nil
+				}
+				rows.Close()
+				log.Logger.Errorf("BuildSQL got err: %v", err)
+				return err
+			}
 
 			if len(keyValues) == 0 {
-				log.StreamLogger.Debug("fetch index data is finished")
+				log.Logger.Debug("fetch index data is finished")
 				pr := &Producer{
 					WhereClause:      execWhere,
 					IsFinished:       true,
 					CurrentKeyValues: keyValues,
 				}
-				producer <- pr
-				wg.Done()
+				if !p.enqueueProducer(producer, pr) {
+					rows.Close()
+					return nil
+				}
+				rows.Close()
 				return nil
 			}
 
 			selectKeyCols = keyValues
+			rows.Close()
 		}
 
 		select {
@@ -243,17 +292,17 @@ func (p *Procedure) BuildSQL(producer chan *Producer, wg *sync.WaitGroup) error 
 func (p *Procedure) fetchFistAndLastData(fetchSql string, args ...any) ([]*KeyValue, bool, error) {
 	resKeyValues := make([]*KeyValue, 0)
 	lastKeyValues := make([]*KeyValue, 0)
-	//log.StreamLogger.Debug("fetchSql: %s", fetchSql)
-	rows, err := p.MysqlClient.Query(fetchSql, args...)
-	defer rows.Close()
+	//log.Logger.Debug("fetchSql: %s", fetchSql)
+	rows, err := p.MysqlClient.QueryContext(p.ctx, fetchSql, args...)
 	if err != nil {
-		log.StreamLogger.Error("fetchFistAndLastData got err: %v", err)
+		log.Logger.Errorf("fetchFistAndLastData got err: %v", err)
 		return nil, false, err
 	}
+	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		log.StreamLogger.Error("fetchFistAndLastData got err: %v", err)
+		log.Logger.Errorf("fetchFistAndLastData got err: %v", err)
 		return nil, false, err
 	}
 
@@ -265,7 +314,7 @@ func (p *Procedure) fetchFistAndLastData(fetchSql string, args ...any) ([]*KeyVa
 		}
 
 		if err = rows.Scan(scanArgs...); err != nil {
-			log.StreamLogger.Error("fetchFistAndLastData Scan got err: %v", err)
+			log.Logger.Errorf("fetchFistAndLastData Scan got err: %v", err)
 			return nil, false, err
 		}
 
@@ -299,6 +348,10 @@ func (p *Procedure) fetchFistAndLastData(fetchSql string, args ...any) ([]*KeyVa
 		}
 		lastKeyValues = tmpKeyValues
 	}
+	if err = rows.Err(); err != nil {
+		log.Logger.Errorf("fetchFistAndLastData rows got err: %v", err)
+		return nil, false, err
+	}
 
 	// 处理在某些情况下倒数第二次只能取到first index value的情况
 	if len(lastKeyValues) == 0 {
@@ -321,7 +374,7 @@ func (p *Procedure) getSingleData(cols []string, rows *sql.Rows) ([]*KeyValue, e
 	}
 
 	if err := rows.Scan(scanArgs...); err != nil {
-		log.StreamLogger.Error("getSingleData Scan got err: %v", err)
+		log.Logger.Errorf("getSingleData Scan got err: %v", err)
 		return nil, err
 	}
 
@@ -394,4 +447,17 @@ func getKeyList(unqKeys *UnqKeys) []string {
 		keys = append(keys, "`"+column+"`")
 	}
 	return keys
+}
+
+func (p *Procedure) enqueueProducer(producer chan *Producer, pr *Producer) bool {
+	select {
+	case <-p.ctx.Done():
+		return false
+	case producer <- pr:
+		return true
+	}
+}
+
+func isContextDoneErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

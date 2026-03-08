@@ -11,7 +11,9 @@ func Test_config(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.PreCheck()
+	if err = config.PreCheck(); err != nil {
+		t.Fatal(err)
+	}
 
 	jsonString, err := json.Marshal(config)
 	if err != nil {

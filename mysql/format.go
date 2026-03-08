@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"go-oak-chunk/v3/utils/string_utils"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/utils/string_utils"
 )
 
 const (

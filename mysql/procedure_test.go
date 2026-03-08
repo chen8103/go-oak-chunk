@@ -1,39 +1,52 @@
 package mysql
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"reflect"
-	"sync"
 	"testing"
+	"time"
 
-	"go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 )
 
 func TestBuildSQL(t *testing.T) {
+	if os.Getenv("GO_OAK_CHUNK_INTEGRATION_TEST") != "1" {
+		t.Skip("skip integration test, set GO_OAK_CHUNK_INTEGRATION_TEST=1 to enable")
+	}
+
 	configPath := "../conf/example.toml"
 	config, err := conf.NewConfig(configPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.PreCheck()
+	if err = config.PreCheck(); err != nil {
+		t.Fatal(err)
+	}
 
-	writer := NewWriter(config)
-	p := NewProcedure(writer)
-	var wg sync.WaitGroup
-	errChan := make(chan error)
+	writer, err := NewWriter(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.MysqlClient.Close()
 
-	wg.Add(1)
+	p := NewProcedure(context.Background(), writer)
+	errChan := make(chan error, 1)
 	go func() {
-		errChan <- p.BuildSQL(writer.ProducerQueue, &wg)
+		errChan <- p.BuildSQL(writer.ProducerQueue)
 	}()
 
-	// wait task done: create doneChan to wait doneWg done
-	doneChan := make(chan struct{})
-	go func() {
-		for pr := range writer.ProducerQueue {
+	for {
+		select {
+		case pr := <-writer.ProducerQueue:
+			if pr == nil {
+				continue
+			}
+
 			fmt.Printf("isFinished: %v\n", pr.IsFinished)
 			if pr.IsFinished {
-				break
+				return
 			}
 
 			println(pr.WhereClause)
@@ -42,21 +55,13 @@ func TestBuildSQL(t *testing.T) {
 				fmt.Printf("%s : %v\n", value.ColumnName, value.ColumnValue)
 			}
 			fmt.Println("---------------")
-		}
-		wg.Wait()
-		doneChan <- struct{}{}
-	}()
-
-	for {
-		select {
 		case err = <-errChan:
 			if err != nil {
 				t.Errorf("got error %s", err)
 				return
-			} else {
-				continue
 			}
-		case <-doneChan:
+		case <-time.After(10 * time.Second):
+			t.Fatal("test timeout waiting for producer output")
 			return
 		}
 	}

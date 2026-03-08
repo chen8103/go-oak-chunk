@@ -5,10 +5,8 @@ import (
 	"os"
 
 	"github.com/pelletier/go-toml"
-	"github.com/realcp1018/tinylog"
 
-	"go-oak-chunk/v3/log"
-	"go-oak-chunk/v3/vars"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
 )
 
 type Config struct {
@@ -39,42 +37,39 @@ type Config struct {
 
 func NewConfig(configPath string) (*Config, error) {
 	file, err := os.Open(configPath)
-	defer file.Close()
 	if err != nil {
-		return nil, fmt.Errorf("failed to open config file, %s", err.Error())
+		return nil, fmt.Errorf("failed to open config file: %w", err)
 	}
+	defer file.Close()
+
 	decoder := toml.NewDecoder(file)
 	c := new(Config)
 	err = decoder.Decode(c)
 	if err != nil {
 		return nil, err
 	}
-	c.PreCheck()
+	if err = c.PreCheck(); err != nil {
+		return nil, err
+	}
+
 	return c, nil
 }
 
-func (c *Config) PreCheck() {
-	// config precheck
-	if c.Debug {
-		log.GlobalLogger.SetLevel(tinylog.LogLevel(vars.DEBUG))
-		log.StreamLogger.SetLevel(tinylog.LogLevel(vars.DEBUG))
-	} else {
-		log.GlobalLogger.SetLevel(tinylog.LogLevel(vars.ERROR))
-		log.StreamLogger.SetLevel(tinylog.LogLevel(vars.ERROR))
-	}
-
+func (c *Config) PreCheck() error {
 	if c.ChunkSize < 0 {
-		log.StreamLogger.Error("Chunk size must be nonnegative number. You can leave the default 1000 if unsure")
-		os.Exit(1)
+		log.Logger.Error("Chunk size must be nonnegative number. You can leave the default 1000 if unsure")
+		return fmt.Errorf("chunk size must be nonnegative number")
 	}
 
 	if c.ExecuteQuery == "" {
-		log.StreamLogger.Error("Query to execute must be provided via -e or --execute")
-		os.Exit(1)
+		log.Logger.Error("Query to execute must be provided via -e or --execute")
+		return fmt.Errorf("query to execute must be provided via -e or --execute")
 	}
 
 	if c.IncludeSlaves != "" && c.ExcludeSlaves != "" {
-		log.StreamLogger.Error("--include-slaves and --exclude-slaves are mutually exclusive.")
-		os.Exit(1)
+		log.Logger.Error("--include-slaves and --exclude-slaves are mutually exclusive.")
+		return fmt.Errorf("--include-slaves and --exclude-slaves are mutually exclusive")
 	}
+
+	return nil
 }

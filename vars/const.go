@@ -30,14 +30,6 @@ const (
 	ConstraintCheck
 )
 
-const (
-	DEBUG uint = iota
-	INFO
-	WARN
-	ERROR
-	FATAL
-)
-
 const LagThreshold int64 = -1
 
 const Billion = 1000000000
