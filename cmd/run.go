@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	oak "go-oak-chunk/v3"
 	"go-oak-chunk/v3/conf"
 	"go-oak-chunk/v3/log"
 	"go-oak-chunk/v3/task"
@@ -50,8 +53,6 @@ var runCmd = &cobra.Command{
 	Long:    `Start chunk dml`,
 	Example: fmt.Sprintf("%s run -c --config <config file>\n", vars.AppName),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		log.StreamLogger.Debug("Go-oak-chunk start...")
-
 		// parse configuration file or cmd line
 		var (
 			config *conf.Config
@@ -60,7 +61,7 @@ var runCmd = &cobra.Command{
 		if configPath != "" {
 			config, err = conf.NewConfig(configPath)
 			if err != nil {
-				log.StreamLogger.Error(err.Error())
+				log.Logger.Errorf("failed to load config [path=%s]: %v", configPath, err)
 				return err
 			}
 		} else {
@@ -86,37 +87,54 @@ var runCmd = &cobra.Command{
 				TxnSize:       txnSize,
 				Correct:       50,
 			}
-			config.PreCheck()
+			if err = config.PreCheck(); err != nil {
+				log.Logger.Errorf("config precheck failed [host=%s, database=%s]: %v", host, database, err)
+				return err
+			}
 		}
 
-		f := StartCpuProfile()
+		if err = log.New(config.Debug, log.OutputStderr); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "failed to initialize logger: %v\n", err)
+			return err
+		}
+		defer log.Logger.Sync()
+		log.Logger.Debugf("go-oak-chunk starting [host=%s:%d, database=%s, execute=%s]",
+			config.Host, config.Port, config.Database, config.ExecuteQuery)
+
+		f, err := StartCpuProfile()
+		if err != nil {
+			log.Logger.Errorf("failed to start CPU profile [cpuprofile=%s]: %v", cpuprofile, err)
+			return err
+		}
 		defer StopCpuProfile(f)
 
-		// finish cpu perf profiling before ctrl-C/kill/kill -15
-		ch := make(chan os.Signal, 5)
-		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			for {
-				sig := <-ch
-				switch sig {
-				case syscall.SIGINT, syscall.SIGTERM:
-					log.StreamLogger.Debug("Terminating process, will finish cpu pprof before exit(if specified)...")
-					StopCpuProfile(f)
-					os.Exit(1)
-				default:
-				}
-			}
-		}()
-
-		// run task
-		err = task.RunTask(config)
+		executor, err := oak.NewExecutor(config)
 		if err != nil {
-			log.StreamLogger.Error(err.Error())
+			log.Logger.Errorf("failed to create executor [host=%s:%d, database=%s]: %v", config.Host, config.Port, config.Database, err)
 			return err
 		}
 
+		runCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+
+		// run task
+		log.Logger.Infof("task started [host=%s:%d, database=%s]", config.Host, config.Port, config.Database)
+		err = executor.Run(runCtx)
+		if err != nil {
+			if errors.Is(err, task.ErrExecutionStopped) {
+				log.Logger.Info("task stopped by signal (SIGINT/SIGTERM)")
+				return nil
+			}
+			log.Logger.Errorf("task execution failed [execute=%s]: %v", config.ExecuteQuery, err)
+			return err
+		}
+		log.Logger.Info("task completed successfully")
+
 		// do memory profiling before exit
-		MemProfile()
+		if err = MemProfile(); err != nil {
+			log.Logger.Errorf("failed to write memory profile [memprofile=%s]: %v", memprofile, err)
+			return err
+		}
 		return nil
 	},
 }
@@ -147,41 +165,42 @@ func initRun() {
 	rootCmd.AddCommand(runCmd)
 }
 
-func StartCpuProfile() *os.File {
+func StartCpuProfile() (*os.File, error) {
 	if cpuprofile != "" {
 		f, err := os.Create(cpuprofile)
 		if err != nil {
-			log.StreamLogger.Fatal("could not create CPU profile: ", err)
+			return nil, fmt.Errorf("could not create CPU profile: %w", err)
 		}
 		if err := pprof.StartCPUProfile(f); err != nil {
-			log.StreamLogger.Fatal("could not start CPU profile: ", err)
+			return nil, fmt.Errorf("could not start CPU profile: %w", err)
 		}
-		log.StreamLogger.Info("cpu pprof start ...")
-		return f
+		log.Logger.Infof("cpu pprof started [file=%s]", cpuprofile)
+		return f, nil
 	}
-	return nil
+	return nil, nil
 }
 
 func StopCpuProfile(f *os.File) {
 	if f != nil {
 		pprof.StopCPUProfile()
 		f.Close()
-		log.StreamLogger.Info("cpu pprof stopped [file=%s]!", cpuprofile)
+		log.Logger.Infof("cpu pprof stopped [file=%s]", cpuprofile)
 		return
 	}
 }
 
-func MemProfile() {
+func MemProfile() error {
 	if memprofile != "" {
 		f, err := os.Create(memprofile)
 		if err != nil {
-			log.StreamLogger.Fatal("could not create memory profile: ", err)
+			return fmt.Errorf("could not create memory profile: %w", err)
 		}
 		defer f.Close()
 		runtime.GC() // get up-to-date statistics
 		if err := pprof.WriteHeapProfile(f); err != nil {
-			log.StreamLogger.Fatal("could not write memory profile: ", err)
+			return fmt.Errorf("could not write memory profile: %w", err)
 		}
-		log.StreamLogger.Info("mem pprof done [file=%s]!", memprofile)
+		log.Logger.Infof("mem pprof done [file=%s]", memprofile)
 	}
+	return nil
 }
