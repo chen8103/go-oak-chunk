@@ -60,6 +60,17 @@ type Proceed struct {
 	IsFinished  bool
 }
 
+type dataSourceType string
+
+const (
+	dataSourceMySQL     dataSourceType = "mysql"
+	dataSourceTiDB      dataSourceType = "tidb"
+	dataSourceOceanBase dataSourceType = "oceanbase"
+
+	queryVersionSQL     = "select version()"
+	obCompatModeOnSQL   = "SET SESSION _show_ddl_in_compat_mode = true"
+)
+
 func NewWriter(c *conf.Config) (*Writer, error) {
 	w := &Writer{
 		noLogBing:     c.NoLogBin,
@@ -286,33 +297,10 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
-	var tableMeta string
 	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
-	rows, err := w.MysqlClient.Query(fmt.Sprintf(vars.TableInfoSQL, ns))
+	tableMeta, err := w.fetchTableMeta(ns)
 	if err != nil {
-		return fmt.Errorf("show create table %s failed: %w", ns, err)
-	}
-
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return fmt.Errorf("show create table %s columns failed: %w", ns, err)
-	}
-
-	for rows.Next() {
-		scanArgs := make([]interface{}, len(cols))
-		for i := range scanArgs {
-			scanArgs[i] = &sql.RawBytes{}
-		}
-
-		if err = rows.Scan(scanArgs...); err != nil {
-			return fmt.Errorf("show create table %s scan failed: %w", ns, err)
-		}
-		tableMeta = ColumnValue(scanArgs, cols, "Create Table")
-	}
-	if err = rows.Err(); err != nil {
-		return fmt.Errorf("show create table %s rows iteration failed: %w", ns, err)
+		return err
 	}
 
 	tableStmt, err := soar.TiParse(tableMeta, "", "")
@@ -357,6 +345,69 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	w.unqKeys = uks[0]
 	return nil
+}
+
+func detectDataSourceFromVersion(version string) dataSourceType {
+	lowerVersion := strings.ToLower(version)
+	switch {
+	case strings.Contains(lowerVersion, string(dataSourceOceanBase)):
+		return dataSourceOceanBase
+	case strings.Contains(lowerVersion, string(dataSourceTiDB)):
+		return dataSourceTiDB
+	default:
+		return dataSourceMySQL
+	}
+}
+
+func (w *Writer) fetchTableMeta(ns string) (string, error) {
+	ctx := context.Background()
+	conn, err := w.MysqlClient.Conn(ctx)
+	if err != nil {
+		return "", fmt.Errorf("get db connection failed: %w", err)
+	}
+	defer conn.Close()
+
+	var version string
+	if err = conn.QueryRowContext(ctx, queryVersionSQL).Scan(&version); err != nil {
+		return "", fmt.Errorf("query version failed: %w", err)
+	}
+
+	dataSource := detectDataSourceFromVersion(version)
+	log.Logger.Debugf("detected data source: [%s], version: [%s]", dataSource, version)
+	if dataSource == dataSourceOceanBase {
+		if _, err = conn.ExecContext(ctx, obCompatModeOnSQL); err != nil {
+			return "", fmt.Errorf("set oceanbase ddl compat mode failed: %w", err)
+		}
+	}
+
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(vars.TableInfoSQL, ns))
+	if err != nil {
+		return "", fmt.Errorf("show create table %s failed: %w", ns, err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return "", fmt.Errorf("show create table %s columns failed: %w", ns, err)
+	}
+
+	var tableMeta string
+	for rows.Next() {
+		scanArgs := make([]interface{}, len(cols))
+		for i := range scanArgs {
+			scanArgs[i] = &sql.RawBytes{}
+		}
+
+		if err = rows.Scan(scanArgs...); err != nil {
+			return "", fmt.Errorf("show create table %s scan failed: %w", ns, err)
+		}
+		tableMeta = ColumnValue(scanArgs, cols, "Create Table")
+	}
+	if err = rows.Err(); err != nil {
+		return "", fmt.Errorf("show create table %s rows iteration failed: %w", ns, err)
+	}
+
+	return tableMeta, nil
 }
 
 func (w *Writer) lockTableRead() error {

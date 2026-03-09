@@ -1,3 +1,14 @@
+### v3.0.1(20250309)
+#### feature:
+1. 在 getInfoFromTable 中通过 `select version()` 识别数据源类型（MySQL/TiDB/OceanBase）
+2. OceanBase 场景下在 SHOW CREATE TABLE 前执行 `SET SESSION _show_ddl_in_compat_mode = true`，获取 MySQL 兼容 DDL
+
+#### optimization:
+1. 获取表结构阶段改为固定连接流程（Conn），确保会话变量与 SHOW CREATE TABLE 在同一连接执行
+2. writer_get_info_test 合并至 writer_test
+
+---
+
 ### v3.0.0(20250308)
 #### feature:
 1. 新增使用文档入口：CLI 使用手册[`doc/design/cli-usage.md`](doc/design/cli-usage.md)、SDK 使用手册[`doc/design/sdk-usage.md`](doc/design/sdk-usage.md)

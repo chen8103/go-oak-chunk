@@ -6,12 +6,16 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/juju/ratelimit"
+
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 )
 
 type writerExecPlan struct {
@@ -348,4 +352,317 @@ func TestWriterWrite_CancelWhileWaitingProducerRollsBack(t *testing.T) {
 	if txs[0].rollbackCalls == 0 {
 		t.Fatalf("expected first tx rollback on cancel while waiting producer")
 	}
+}
+
+// ---- getInfoFromTable tests ----
+
+const defaultCreateTableDDL = "CREATE TABLE `t1` (\n" +
+	"  `id` bigint NOT NULL,\n" +
+	"  PRIMARY KEY (`id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+type getInfoCall struct {
+	op     string
+	connID int
+}
+
+type getInfoPlan struct {
+	version       string
+	versionErr    error
+	setSessionErr error
+	showCreateErr error
+}
+
+type getInfoDriverState struct {
+	mu sync.Mutex
+
+	plan       getInfoPlan
+	nextConnID int
+	calls      []getInfoCall
+}
+
+type getInfoFakeDriver struct {
+	state *getInfoDriverState
+}
+
+type getInfoFakeConn struct {
+	state  *getInfoDriverState
+	connID int
+}
+
+type getInfoFakeRows struct {
+	columns []string
+	rows    [][]driver.Value
+	index   int
+}
+
+var getInfoDriverSeq atomic.Int64
+
+func (d *getInfoFakeDriver) Open(_ string) (driver.Conn, error) {
+	d.state.mu.Lock()
+	defer d.state.mu.Unlock()
+
+	d.state.nextConnID++
+	return &getInfoFakeConn{
+		state:  d.state,
+		connID: d.state.nextConnID,
+	}, nil
+}
+
+func (c *getInfoFakeConn) Prepare(_ string) (driver.Stmt, error) {
+	return nil, errors.New("prepare is not implemented in get info fake conn")
+}
+
+func (c *getInfoFakeConn) Close() error {
+	return nil
+}
+
+func (c *getInfoFakeConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("begin is not implemented in get info fake conn")
+}
+
+func (c *getInfoFakeConn) recordCall(op string) getInfoPlan {
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	c.state.calls = append(c.state.calls, getInfoCall{
+		op:     op,
+		connID: c.connID,
+	})
+	return c.state.plan
+}
+
+func (c *getInfoFakeConn) QueryContext(
+	_ context.Context, query string, _ []driver.NamedValue,
+) (driver.Rows, error) {
+	lowerQuery := strings.ToLower(strings.TrimSpace(query))
+	switch {
+	case strings.Contains(lowerQuery, "select version()"):
+		plan := c.recordCall("version")
+		if plan.versionErr != nil {
+			return nil, plan.versionErr
+		}
+		version := plan.version
+		if version == "" {
+			version = "8.0.36"
+		}
+		return &getInfoFakeRows{
+			columns: []string{"version()"},
+			rows: [][]driver.Value{
+				{[]byte(version)},
+			},
+		}, nil
+	case strings.Contains(lowerQuery, "show create table"):
+		plan := c.recordCall("show_create")
+		if plan.showCreateErr != nil {
+			return nil, plan.showCreateErr
+		}
+		return &getInfoFakeRows{
+			columns: []string{"Table", "Create Table"},
+			rows: [][]driver.Value{
+				{[]byte("t1"), []byte(defaultCreateTableDDL)},
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unexpected query: %s", query)
+	}
+}
+
+func (c *getInfoFakeConn) Query(query string, args []driver.Value) (driver.Rows, error) {
+	_ = args
+	return c.QueryContext(context.Background(), query, nil)
+}
+
+func (c *getInfoFakeConn) ExecContext(
+	_ context.Context, query string, _ []driver.NamedValue,
+) (driver.Result, error) {
+	lowerQuery := strings.ToLower(strings.TrimSpace(query))
+	if !strings.Contains(lowerQuery, "_show_ddl_in_compat_mode") {
+		return nil, fmt.Errorf("unexpected exec: %s", query)
+	}
+
+	plan := c.recordCall("set_ob_compat")
+	if plan.setSessionErr != nil {
+		return nil, plan.setSessionErr
+	}
+	return driver.RowsAffected(0), nil
+}
+
+func (c *getInfoFakeConn) Exec(query string, args []driver.Value) (driver.Result, error) {
+	_ = args
+	return c.ExecContext(context.Background(), query, nil)
+}
+
+func (r *getInfoFakeRows) Columns() []string {
+	return r.columns
+}
+
+func (r *getInfoFakeRows) Close() error {
+	return nil
+}
+
+func (r *getInfoFakeRows) Next(dest []driver.Value) error {
+	if r.index >= len(r.rows) {
+		return io.EOF
+	}
+	row := r.rows[r.index]
+	r.index++
+	for i := range dest {
+		if i < len(row) {
+			dest[i] = row[i]
+			continue
+		}
+		dest[i] = nil
+	}
+	return nil
+}
+
+func newGetInfoTestDB(t *testing.T, plan getInfoPlan) (*sql.DB, *getInfoDriverState) {
+	t.Helper()
+
+	state := &getInfoDriverState{plan: plan}
+	driverName := fmt.Sprintf("writer_get_info_driver_%d", getInfoDriverSeq.Add(1))
+	sql.Register(driverName, &getInfoFakeDriver{state: state})
+	db, err := sql.Open(driverName, "writer-get-info-test")
+	if err != nil {
+		t.Fatalf("open get info fake db failed: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db, state
+}
+
+func newWriterGetInfoForTest(db *sql.DB) *Writer {
+	return &Writer{
+		MysqlClient: db,
+		ExecuteSQL:  "DELETE FROM `t1` WHERE `id` > 0",
+		Database:   "test_db",
+		Table:      "t1",
+	}
+}
+
+func snapshotGetInfoCalls(state *getInfoDriverState) []getInfoCall {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	calls := make([]getInfoCall, 0, len(state.calls))
+	calls = append(calls, state.calls...)
+	return calls
+}
+
+func assertGetInfoCalls(t *testing.T, calls []getInfoCall, wantOps []string) {
+	t.Helper()
+	if len(calls) != len(wantOps) {
+		t.Fatalf("call count mismatch, got %d want %d, calls=%+v", len(calls), len(wantOps), calls)
+	}
+	for i := range wantOps {
+		if calls[i].op != wantOps[i] {
+			t.Fatalf("call[%d] op mismatch, got %s want %s", i, calls[i].op, wantOps[i])
+		}
+	}
+}
+
+func assertSingleConnUsed(t *testing.T, calls []getInfoCall) {
+	t.Helper()
+	if len(calls) == 0 {
+		t.Fatalf("calls should not be empty")
+	}
+	connID := calls[0].connID
+	if connID == 0 {
+		t.Fatalf("invalid connID in first call")
+	}
+	for i := range calls {
+		if calls[i].connID != connID {
+			t.Fatalf("calls use different conn id, got %+v", calls)
+		}
+	}
+}
+
+func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		wantOps []string
+	}{
+		{
+			name:    "mysql_version_no_set_session",
+			version: "8.0.36",
+			wantOps: []string{"version", "show_create"},
+		},
+		{
+			name:    "tidb_version_no_set_session",
+			version: "8.0.11-TiDB-v8.1.1",
+			wantOps: []string{"version", "show_create"},
+		},
+		{
+			name:    "oceanbase_version_set_session_before_show_create",
+			version: "5.7.25-OceanBase-v4.2.5.4",
+			wantOps: []string{"version", "set_ob_compat", "show_create"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, state := newGetInfoTestDB(t, getInfoPlan{version: tt.version})
+			w := newWriterGetInfoForTest(db)
+			err := w.getInfoFromTable(&conf.Config{
+				ExecuteQuery: w.ExecuteSQL,
+			})
+			if err != nil {
+				t.Fatalf("getInfoFromTable returned err: %v", err)
+			}
+			if w.unqKeys == nil {
+				t.Fatalf("expected unqKeys to be initialized")
+			}
+
+			calls := snapshotGetInfoCalls(state)
+			assertGetInfoCalls(t, calls, tt.wantOps)
+			assertSingleConnUsed(t, calls)
+		})
+	}
+}
+
+func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
+	t.Run("version_query_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			versionErr: errors.New("version query failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "query version failed") {
+			t.Fatalf("expected query version failed error, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version"})
+	})
+
+	t.Run("oceanbase_set_session_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:       "5.7.25-OceanBase-v4.2.5.4",
+			setSessionErr: errors.New("set session failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "set oceanbase ddl compat mode failed") {
+			t.Fatalf("expected set oceanbase ddl compat mode failed error, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "set_ob_compat"})
+	})
+
+	t.Run("show_create_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:       "8.0.36",
+			showCreateErr: errors.New("show create failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "show create table `test_db`.`t1` failed") {
+			t.Fatalf("expected show create table failed error, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "show_create"})
+	})
 }
