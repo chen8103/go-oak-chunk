@@ -79,7 +79,7 @@ go run ./cmd/go-oak-chunk run --help
 | `--memprofile` | string / 空 | 否 | 输出内存 profile 文件 | 任务结束后写出 |
 | `--chunk-size` | int64 / `1000` | 否 | 每个 chunk 处理行数 | `0` 表示一次性；`1` 表示逐行 |
 | `-e, --execute` | string / 空 | 是 | 要执行的 SQL | 必须是单条 `UPDATE/DELETE`，应包含 `WHERE` |
-| `--force-chunking-column` | string / 空 | 否 | 强制指定 chunk 键列 | 必须与某个主键/唯一键列集合一致 |
+| `--force-chunking-column` | string / 空 | 否 | 强制指定 chunk 键列 | 必须与某个主键/唯一键列集合一致；OB 下会额外基于 `SHOW INDEX` 校验 |
 | `-H, --host` | string / `localhost` | 否 | MySQL 主机 | |
 | `-P, --port` | int / `3306` | 否 | MySQL 端口 | |
 | `-u, --user` | string / `root` | 否 | MySQL 用户 | |
@@ -178,7 +178,7 @@ CLI 启动后会做关键校验：
 6. SQL 类型必须是 `UPDATE` 或 `DELETE`
 7. 目标表必须存在
 8. 目标表必须存在可用主键/唯一键
-9. 若设置 `forced_chunking_column`，必须精确匹配某个唯一键列集合
+9. 若设置 `forced_chunking_column`，必须精确匹配某个唯一键列集合；逗号两侧空格会自动忽略
 
 ---
 
@@ -309,6 +309,9 @@ go tool pprof -http=:8081 mem.pprof
   -H 127.0.0.1 -P 4000 -u root -p 'xxx'
 ```
 
+> OceanBase 下会先通过兼容 DDL 获取列定义，再额外执行 `SHOW INDEX` 识别主键/唯一键。
+> 因此即使兼容 DDL 中缺失全局唯一键，`--force-chunking-column order_code` 这类指定也仍可命中真实唯一索引。
+
 ---
 
 ## 13. 性能调优建议
@@ -341,6 +344,7 @@ go tool pprof -http=:8081 mem.pprof
 | `please confirm sql type is update or delete` | SQL 不是 Update/Delete | 改为支持类型 |
 | `can't find any index which is primary or unique key` | 目标表无主键/唯一键 | 增加唯一键或改表 |
 | `forced_chunking_column doesn't conform ...` | 指定 chunk 列不匹配唯一键 | 改为真实唯一键列集合 |
+| `show index ... failed` | OceanBase 索引元数据查询失败 | 检查权限、连接状态与表名；显式设置 `forced_chunking_column` 时会直接失败 |
 | 运行中提示 `task stopped by signal` | 收到 SIGINT/SIGTERM | 正常停止语义 |
 | 从库 lag 查询错误后继续运行 | 某些从库不可用或非标准拓扑 | 可用 `--no-slaves` 或过滤从库 |
 
@@ -366,4 +370,3 @@ go tool pprof -http=:8081 mem.pprof
 5. `run` 正常被信号停止时按成功处理，不属于错误退出
 
 以上 5 点建议在团队内作为统一使用约定。
-

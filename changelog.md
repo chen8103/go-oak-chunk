@@ -1,3 +1,11 @@
+### v3.1.0(20260415)
+#### bugFix:
+1. 修复 OceanBase 场景下仅靠兼容 DDL 无法识别全局唯一键的问题；现在会额外通过 `SHOW INDEX` 发现主键/唯一键候选
+2. 修复 `forced_chunking_column` 在 OceanBase 下无法命中兼容 DDL 中缺失的真实唯一键的问题，如 `uk_order_code(order_code)`
+
+#### optimization:
+1. `forced_chunking_column` 输入会自动忽略逗号两侧空格，复合键配置更稳健
+
 ### v3.0.1(20250309)
 #### feature:
 1. 在 getInfoFromTable 中通过 `select version()` 识别数据源类型（MySQL/TiDB/OceanBase）

@@ -146,7 +146,7 @@ func main() {
 | `IncludeSlaves` | `string` | 按需 | 仅监控这些从库 |
 | `ExcludeSlaves` | `string` | 按需 | 排除这些从库 |
 | `NoSlaves` | `bool` | 按需 | 跳过从库检查 |
-| `ForceChunkingColumn` | `string` | 按需 | 强制使用指定唯一键列集 |
+| `ForceChunkingColumn` | `string` | 按需 | 强制使用指定唯一键列集；OB 下会额外基于 `SHOW INDEX` 校验，逗号两侧空格会自动忽略 |
 | `PrintProgress` | `bool` | SDK 通常 `false` | CLI 终端输出模式开关 |
 | `Debug` | `bool` | 按需 | debug 日志 |
 | `Correct` | `int64` | **建议 50** | 限流修正值 |
@@ -232,6 +232,7 @@ default:
 - 目标表不存在
 - 找不到主键或唯一键
 - `ForceChunkingColumn` 不匹配
+- OceanBase 下 `SHOW INDEX` 查询失败（显式设置 `ForceChunkingColumn` 时会直接报错）
 - 数据库连接失败或执行失败
 
 ---
@@ -383,6 +384,7 @@ oaklog.NewFromSugaredLogger(sugar)
 | `please confirm sql type is update or delete` | SQL 类型不支持 | 仅使用单条 Update/Delete |
 | `can't find any index which is primary or unique key` | 表无唯一键 | 增加主键/唯一键 |
 | `forced_chunking_column doesn't conform ...` | 指定列不匹配唯一键 | 使用真实唯一键列集合 |
+| `show index ... failed` | OceanBase 索引元数据查询失败 | 检查权限、连接状态与表名；若设置了 `ForceChunkingColumn` 会直接失败 |
 | 回调触发频率不稳定 | 回调执行太慢，tick 被跳过 | 缩短回调逻辑，异步化重操作 |
 
 ---
@@ -467,4 +469,3 @@ func RunChunkJob(ctx context.Context, cfg *conf.Config) error {
 ```
 
 这个模式基本覆盖了生产中的“可观测 + 可调速 + 可中断”的核心诉求。
-

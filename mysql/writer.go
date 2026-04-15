@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -67,9 +66,22 @@ const (
 	dataSourceTiDB      dataSourceType = "tidb"
 	dataSourceOceanBase dataSourceType = "oceanbase"
 
-	queryVersionSQL     = "select version()"
-	obCompatModeOnSQL   = "SET SESSION _show_ddl_in_compat_mode = true"
+	queryVersionSQL   = "select version()"
+	obCompatModeOnSQL = "SET SESSION _show_ddl_in_compat_mode = true"
+	obShowIndexSQL    = "show index from %s"
 )
+
+type columnMeta struct {
+	columnType byte
+	isNull     bool
+}
+
+type showIndexRow struct {
+	keyName    string
+	seqInIndex int64
+	columnName string
+	nonUnique  int64
+}
 
 func NewWriter(c *conf.Config) (*Writer, error) {
 	w := &Writer{
@@ -295,10 +307,28 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		w.ExecuteSQL += w.OriginWhereClause
 	}
 
+	forceColumns, err := normalizeForceChunkingColumns(c.ForceChunkingColumn)
+	if err != nil {
+		return err
+	}
+
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
 	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
-	tableMeta, err := w.fetchTableMeta(ns)
+	ctx := context.Background()
+	conn, dataSource, err := w.openMetadataConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if dataSource == dataSourceOceanBase {
+		if err = w.enableOceanBaseDDLCompatMode(ctx, conn); err != nil {
+			return err
+		}
+	}
+
+	tableMeta, err := w.fetchTableMeta(ctx, conn, ns)
 	if err != nil {
 		return err
 	}
@@ -309,9 +339,43 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	}
 
 	uks := make([]*UnqKeys, 0)
+	keySource := "show_create_table"
 	switch tableNode := tableStmt[0].(type) {
 	case *ast.CreateTableStmt:
-		uks = GetPossibleUniqueKeys(tableNode)
+		columnMetas := buildColumnMetas(tableNode)
+		ddlUniqueKeys := GetPossibleUniqueKeys(tableNode)
+		uks = ddlUniqueKeys
+
+		if dataSource == dataSourceOceanBase {
+			indexUniqueKeys, indexErr := w.fetchUniqueKeysFromShowIndex(
+				ctx, conn, ns, columnMetas,
+			)
+			switch {
+			case indexErr != nil:
+				if len(forceColumns) > 0 {
+					return indexErr
+				}
+				log.Logger.Warnf(
+					"show index %s failed, fallback to show create table unique keys: %v",
+					ns, indexErr,
+				)
+			case len(indexUniqueKeys) == 0:
+				if len(forceColumns) > 0 {
+					return fmt.Errorf(
+						"show index %s returned no primary or unique key for forced_chunking_column: %s",
+						ns, strings.Join(forceColumns, ","),
+					)
+				}
+				log.Logger.Warnf(
+					"show index %s returned no primary or unique key, fallback to show create table unique keys",
+					ns,
+				)
+			default:
+				uks = indexUniqueKeys
+				keySource = "show_index"
+			}
+		}
+
 		if len(uks) == 0 {
 			return fmt.Errorf("can't find any index which is primary or unique key")
 		}
@@ -319,32 +383,18 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return fmt.Errorf("table meta is not CreateTableStmt, tableMeta: %s", tableMeta)
 	}
 
-	if c.ForceChunkingColumn != "" {
-		uniqueColumns := strings.Split(c.ForceChunkingColumn, ",")
-		sort.Strings(uniqueColumns)
-		for _, uk := range uks {
-			sortKeys := make([]string, len(uk.UniqueKeyColumns))
-			copy(sortKeys, uk.UniqueKeyColumns)
-			sort.Strings(sortKeys)
-			if reflect.DeepEqual(uniqueColumns, sortKeys) {
-				w.unqKeys = uk
-				return nil
-			}
-		}
-
-		// 如果for结束没有数据，说明使用者瞎写的ForceChunkingColumn
-		return fmt.Errorf("forced_chunking_column doesn't conform to primary or unique key, forceChunkingColumn: %s", c.ForceChunkingColumn)
+	w.unqKeys, err = selectChunkingKey(uks, forceColumns, c.ForceChunkingColumn)
+	if err == nil && w.unqKeys != nil {
+		log.Logger.Debugf(
+			"selected chunking key [data_source=%s, metadata_source=%s, tp=%d, columns=%s, forced=%s]",
+			dataSource,
+			keySource,
+			w.unqKeys.Tp,
+			strings.Join(w.unqKeys.UniqueKeyColumns, ","),
+			c.ForceChunkingColumn,
+		)
 	}
-
-	for _, uk := range uks {
-		if uk.Tp == vars.ConstraintPrimaryKey {
-			w.unqKeys = uk
-			return nil
-		}
-	}
-
-	w.unqKeys = uks[0]
-	return nil
+	return err
 }
 
 func detectDataSourceFromVersion(version string) dataSourceType {
@@ -359,27 +409,37 @@ func detectDataSourceFromVersion(version string) dataSourceType {
 	}
 }
 
-func (w *Writer) fetchTableMeta(ns string) (string, error) {
-	ctx := context.Background()
+func (w *Writer) openMetadataConn(
+	ctx context.Context,
+) (*sql.Conn, dataSourceType, error) {
 	conn, err := w.MysqlClient.Conn(ctx)
 	if err != nil {
-		return "", fmt.Errorf("get db connection failed: %w", err)
+		return nil, "", fmt.Errorf("get db connection failed: %w", err)
 	}
-	defer conn.Close()
 
 	var version string
 	if err = conn.QueryRowContext(ctx, queryVersionSQL).Scan(&version); err != nil {
-		return "", fmt.Errorf("query version failed: %w", err)
+		conn.Close()
+		return nil, "", fmt.Errorf("query version failed: %w", err)
 	}
 
 	dataSource := detectDataSourceFromVersion(version)
 	log.Logger.Debugf("detected data source: [%s], version: [%s]", dataSource, version)
-	if dataSource == dataSourceOceanBase {
-		if _, err = conn.ExecContext(ctx, obCompatModeOnSQL); err != nil {
-			return "", fmt.Errorf("set oceanbase ddl compat mode failed: %w", err)
-		}
-	}
+	return conn, dataSource, nil
+}
 
+func (w *Writer) enableOceanBaseDDLCompatMode(
+	ctx context.Context, conn *sql.Conn,
+) error {
+	if _, err := conn.ExecContext(ctx, obCompatModeOnSQL); err != nil {
+		return fmt.Errorf("set oceanbase ddl compat mode failed: %w", err)
+	}
+	return nil
+}
+
+func (w *Writer) fetchTableMeta(
+	ctx context.Context, conn *sql.Conn, ns string,
+) (string, error) {
 	rows, err := conn.QueryContext(ctx, fmt.Sprintf(vars.TableInfoSQL, ns))
 	if err != nil {
 		return "", fmt.Errorf("show create table %s failed: %w", ns, err)
@@ -408,6 +468,217 @@ func (w *Writer) fetchTableMeta(ns string) (string, error) {
 	}
 
 	return tableMeta, nil
+}
+
+func normalizeForceChunkingColumns(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	cols := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		cols = append(cols, part)
+	}
+	if len(cols) == 0 {
+		return nil, fmt.Errorf(
+			"forced_chunking_column is empty after normalization, forceChunkingColumn: %s",
+			raw,
+		)
+	}
+	return cols, nil
+}
+
+func comparableColumns(columns []string) []string {
+	normalized := make([]string, 0, len(columns))
+	for _, column := range columns {
+		column = strings.TrimSpace(column)
+		if column == "" {
+			continue
+		}
+		normalized = append(normalized, strings.ToLower(column))
+	}
+	sort.Strings(normalized)
+	return normalized
+}
+
+func selectChunkingKey(
+	uks []*UnqKeys, forceColumns []string, rawForce string,
+) (*UnqKeys, error) {
+	if len(forceColumns) > 0 {
+		targetColumns := comparableColumns(forceColumns)
+		for _, uk := range uks {
+			if len(targetColumns) != len(uk.UniqueKeyColumns) {
+				continue
+			}
+			if strings.Join(targetColumns, ",") ==
+				strings.Join(comparableColumns(uk.UniqueKeyColumns), ",") {
+				return uk, nil
+			}
+		}
+
+		return nil, fmt.Errorf(
+			"forced_chunking_column doesn't conform to primary or unique key, forceChunkingColumn: %s",
+			rawForce,
+		)
+	}
+
+	for _, uk := range uks {
+		if uk.Tp == vars.ConstraintPrimaryKey {
+			return uk, nil
+		}
+	}
+
+	return uks[0], nil
+}
+
+func buildColumnMetas(tableNode *ast.CreateTableStmt) map[string]columnMeta {
+	columnMetas := make(map[string]columnMeta, len(tableNode.Cols))
+	for _, col := range tableNode.Cols {
+		isNull := true
+		for _, option := range col.Options {
+			if option.Tp == ast.ColumnOptionNotNull {
+				isNull = false
+				break
+			}
+		}
+		columnMetas[strings.ToLower(col.Name.Name.String())] = columnMeta{
+			columnType: col.Tp.Tp,
+			isNull:     isNull,
+		}
+	}
+	return columnMetas
+}
+
+func buildUniqueKeysFromShowIndexRows(
+	indexRows []*showIndexRow, columnMetas map[string]columnMeta,
+) []*UnqKeys {
+	type groupedIndex struct {
+		tp   int
+		rows []*showIndexRow
+	}
+
+	grouped := make(map[string]*groupedIndex)
+	order := make([]string, 0)
+	for _, row := range indexRows {
+		if row == nil || row.nonUnique != 0 {
+			continue
+		}
+
+		group, ok := grouped[row.keyName]
+		if !ok {
+			group = &groupedIndex{tp: vars.ConstraintUniqKey}
+			if strings.EqualFold(row.keyName, "PRIMARY") {
+				group.tp = vars.ConstraintPrimaryKey
+			}
+			grouped[row.keyName] = group
+			order = append(order, row.keyName)
+		}
+		group.rows = append(group.rows, row)
+	}
+
+	uks := make([]*UnqKeys, 0, len(order))
+	for _, keyName := range order {
+		group := grouped[keyName]
+		sort.Slice(group.rows, func(i, j int) bool {
+			return group.rows[i].seqInIndex < group.rows[j].seqInIndex
+		})
+
+		uk := &UnqKeys{
+			UniqueKeyColumns: make([]string, 0, len(group.rows)),
+			UniqueKeyTypes:   make([]byte, 0, len(group.rows)),
+			IsNull:           make([]bool, 0, len(group.rows)),
+			Tp:               group.tp,
+		}
+
+		valid := true
+		for _, row := range group.rows {
+			meta, ok := columnMetas[strings.ToLower(row.columnName)]
+			if !ok {
+				valid = false
+				break
+			}
+			uk.UniqueKeyColumns = append(uk.UniqueKeyColumns, row.columnName)
+			uk.UniqueKeyTypes = append(uk.UniqueKeyTypes, meta.columnType)
+			uk.IsNull = append(uk.IsNull, meta.isNull)
+		}
+		if !valid || len(uk.UniqueKeyColumns) == 0 {
+			continue
+		}
+
+		uk.CountColumns = len(uk.UniqueKeyColumns)
+		uks = append(uks, uk)
+	}
+
+	return uks
+}
+
+func (w *Writer) fetchUniqueKeysFromShowIndex(
+	ctx context.Context,
+	conn *sql.Conn,
+	ns string,
+	columnMetas map[string]columnMeta,
+) ([]*UnqKeys, error) {
+	rows, err := conn.QueryContext(ctx, fmt.Sprintf(obShowIndexSQL, ns))
+	if err != nil {
+		return nil, fmt.Errorf("show index %s failed: %w", ns, err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, fmt.Errorf("show index %s columns failed: %w", ns, err)
+	}
+
+	indexRows := make([]*showIndexRow, 0)
+	for rows.Next() {
+		scanArgs := make([]interface{}, len(cols))
+		for i := range scanArgs {
+			scanArgs[i] = &sql.RawBytes{}
+		}
+
+		if err = rows.Scan(scanArgs...); err != nil {
+			return nil, fmt.Errorf("show index %s scan failed: %w", ns, err)
+		}
+
+		nonUnique, err := ColumnValueInt64(scanArgs, cols, "Non_unique")
+		if err != nil {
+			return nil, fmt.Errorf(
+				"show index %s parse Non_unique failed: %w", ns, err,
+			)
+		}
+		seqInIndex, err := ColumnValueInt64(scanArgs, cols, "Seq_in_index")
+		if err != nil {
+			return nil, fmt.Errorf(
+				"show index %s parse Seq_in_index failed: %w", ns, err,
+			)
+		}
+
+		keyName := strings.TrimSpace(ColumnValue(scanArgs, cols, "Key_name"))
+		columnName := strings.TrimSpace(ColumnValue(scanArgs, cols, "Column_name"))
+		if keyName == "" || columnName == "" {
+			return nil, fmt.Errorf(
+				"show index %s returned incomplete key metadata, key_name=%q column_name=%q",
+				ns, keyName, columnName,
+			)
+		}
+
+		indexRows = append(indexRows, &showIndexRow{
+			keyName:    keyName,
+			seqInIndex: seqInIndex,
+			columnName: columnName,
+			nonUnique:  nonUnique,
+		})
+	}
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("show index %s rows iteration failed: %w", ns, err)
+	}
+
+	return buildUniqueKeysFromShowIndexRows(indexRows, columnMetas), nil
 }
 
 func (w *Writer) lockTableRead() error {

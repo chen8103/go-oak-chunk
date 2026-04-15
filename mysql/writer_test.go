@@ -16,6 +16,7 @@ import (
 	"github.com/juju/ratelimit"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 type writerExecPlan struct {
@@ -361,16 +362,32 @@ const defaultCreateTableDDL = "CREATE TABLE `t1` (\n" +
 	"  PRIMARY KEY (`id`)\n" +
 	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
 
+const compositePrimaryCreateTableDDL = "CREATE TABLE `t1` (\n" +
+	"  `id` bigint NOT NULL,\n" +
+	"  `user_id` bigint NOT NULL,\n" +
+	"  PRIMARY KEY (`id`, `user_id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
+const oceanBaseCompatCreateTableDDL = "CREATE TABLE `t1` (\n" +
+	"  `id` bigint NOT NULL,\n" +
+	"  `user_id` bigint NOT NULL,\n" +
+	"  `order_code` varchar(255) NOT NULL,\n" +
+	"  PRIMARY KEY (`id`, `user_id`)\n" +
+	") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+
 type getInfoCall struct {
 	op     string
 	connID int
 }
 
 type getInfoPlan struct {
-	version       string
-	versionErr    error
-	setSessionErr error
-	showCreateErr error
+	version        string
+	versionErr     error
+	setSessionErr  error
+	createTableDDL string
+	showCreateErr  error
+	showIndexRows  [][]driver.Value
+	showIndexErr   error
 }
 
 type getInfoDriverState struct {
@@ -456,11 +473,36 @@ func (c *getInfoFakeConn) QueryContext(
 		if plan.showCreateErr != nil {
 			return nil, plan.showCreateErr
 		}
+		createTableDDL := plan.createTableDDL
+		if createTableDDL == "" {
+			createTableDDL = defaultCreateTableDDL
+		}
 		return &getInfoFakeRows{
 			columns: []string{"Table", "Create Table"},
 			rows: [][]driver.Value{
-				{[]byte("t1"), []byte(defaultCreateTableDDL)},
+				{[]byte("t1"), []byte(createTableDDL)},
 			},
+		}, nil
+	case strings.Contains(lowerQuery, "show index from"):
+		plan := c.recordCall("show_index")
+		if plan.showIndexErr != nil {
+			return nil, plan.showIndexErr
+		}
+		rows := plan.showIndexRows
+		if rows == nil {
+			rows = [][]driver.Value{
+				{
+					[]byte("t1"),
+					[]byte("0"),
+					[]byte("PRIMARY"),
+					[]byte("1"),
+					[]byte("id"),
+				},
+			}
+		}
+		return &getInfoFakeRows{
+			columns: []string{"Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name"},
+			rows:    rows,
 		}, nil
 	default:
 		return nil, fmt.Errorf("unexpected query: %s", query)
@@ -536,8 +578,8 @@ func newWriterGetInfoForTest(db *sql.DB) *Writer {
 	return &Writer{
 		MysqlClient: db,
 		ExecuteSQL:  "DELETE FROM `t1` WHERE `id` > 0",
-		Database:   "test_db",
-		Table:      "t1",
+		Database:    "test_db",
+		Table:       "t1",
 	}
 }
 
@@ -596,7 +638,7 @@ func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
 		{
 			name:    "oceanbase_version_set_session_before_show_create",
 			version: "5.7.25-OceanBase-v4.2.5.4",
-			wantOps: []string{"version", "set_ob_compat", "show_create"},
+			wantOps: []string{"version", "set_ob_compat", "show_create", "show_index"},
 		},
 	}
 
@@ -665,4 +707,141 @@ func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
 		}
 		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "show_create"})
 	})
+
+	t.Run("oceanbase_show_index_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:      "5.7.25-OceanBase-v4.2.5.4",
+			showIndexErr: errors.New("show index failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery:        w.ExecuteSQL,
+			ForceChunkingColumn: "id",
+		})
+		if err == nil || !strings.Contains(err.Error(), "show index `test_db`.`t1` failed") {
+			t.Fatalf("expected show index failure, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{
+			"version", "set_ob_compat", "show_create", "show_index",
+		})
+	})
+}
+
+func assertUniqueKeyColumns(t *testing.T, uk *UnqKeys, tp int, wantColumns []string) {
+	t.Helper()
+	if uk == nil {
+		t.Fatalf("expected unique key to be selected")
+	}
+	if uk.Tp != tp {
+		t.Fatalf("unexpected key type, got %d want %d", uk.Tp, tp)
+	}
+	if len(uk.UniqueKeyColumns) != len(wantColumns) {
+		t.Fatalf("unexpected key column count, got %v want %v", uk.UniqueKeyColumns, wantColumns)
+	}
+	for i := range wantColumns {
+		if uk.UniqueKeyColumns[i] != wantColumns[i] {
+			t.Fatalf("unexpected key columns, got %v want %v", uk.UniqueKeyColumns, wantColumns)
+		}
+	}
+}
+
+func TestWriterGetInfoFromTable_OceanBaseUniqueKeyDiscovery(t *testing.T) {
+	showIndexRows := [][]driver.Value{
+		{
+			[]byte("t1"),
+			[]byte("0"),
+			[]byte("PRIMARY"),
+			[]byte("1"),
+			[]byte("id"),
+		},
+		{
+			[]byte("t1"),
+			[]byte("0"),
+			[]byte("PRIMARY"),
+			[]byte("2"),
+			[]byte("user_id"),
+		},
+		{
+			[]byte("t1"),
+			[]byte("0"),
+			[]byte("uk_order_code"),
+			[]byte("1"),
+			[]byte("order_code"),
+		},
+	}
+
+	t.Run("force_chunking_column_can_use_ob_unique_key", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:        "5.7.25-OceanBase-v4.2.5.4",
+			createTableDDL: oceanBaseCompatCreateTableDDL,
+			showIndexRows:  showIndexRows,
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery:        w.ExecuteSQL,
+			ForceChunkingColumn: "order_code",
+		})
+		if err != nil {
+			t.Fatalf("getInfoFromTable returned err: %v", err)
+		}
+
+		assertUniqueKeyColumns(t, w.unqKeys, vars.ConstraintUniqKey, []string{"order_code"})
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{
+			"version", "set_ob_compat", "show_create", "show_index",
+		})
+	})
+
+	t.Run("default_selection_still_prefers_primary_key", func(t *testing.T) {
+		db, _ := newGetInfoTestDB(t, getInfoPlan{
+			version:        "5.7.25-OceanBase-v4.2.5.4",
+			createTableDDL: oceanBaseCompatCreateTableDDL,
+			showIndexRows:  showIndexRows,
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err != nil {
+			t.Fatalf("getInfoFromTable returned err: %v", err)
+		}
+
+		assertUniqueKeyColumns(t, w.unqKeys, vars.ConstraintPrimaryKey, []string{"id", "user_id"})
+	})
+
+	t.Run("show_index_failure_without_force_falls_back_to_ddl", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:        "5.7.25-OceanBase-v4.2.5.4",
+			createTableDDL: oceanBaseCompatCreateTableDDL,
+			showIndexErr:   errors.New("show index failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err != nil {
+			t.Fatalf("getInfoFromTable returned err: %v", err)
+		}
+
+		assertUniqueKeyColumns(t, w.unqKeys, vars.ConstraintPrimaryKey, []string{"id", "user_id"})
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{
+			"version", "set_ob_compat", "show_create", "show_index",
+		})
+	})
+}
+
+func TestWriterGetInfoFromTable_ForceChunkingColumnNormalization(t *testing.T) {
+	db, _ := newGetInfoTestDB(t, getInfoPlan{
+		version:        "8.0.36",
+		createTableDDL: compositePrimaryCreateTableDDL,
+	})
+	w := newWriterGetInfoForTest(db)
+	err := w.getInfoFromTable(&conf.Config{
+		ExecuteQuery:        w.ExecuteSQL,
+		ForceChunkingColumn: "id, user_id",
+	})
+	if err != nil {
+		t.Fatalf("getInfoFromTable returned err: %v", err)
+	}
+
+	assertUniqueKeyColumns(t, w.unqKeys, vars.ConstraintPrimaryKey, []string{"id", "user_id"})
 }
