@@ -56,6 +56,67 @@ func WithProgressCallback(cb ProgressCallback, interval time.Duration) Option {
 	}
 }
 
+// WithOBCovering enables the OceanBase covering-index two-phase fast path
+// (DELETE only). index is an optional FORCE INDEX name (empty allowed); orderBy
+// is the comma-separated order column list (required for the fast path); cursor
+// enables cursor advancement to avoid re-scanning from the start.
+//
+// Mutual-exclusion/dependency validation is performed in NewExecutor's
+// config.PreCheck (e.g. fast path requires a DELETE query).
+func WithOBCovering(index, orderBy string, cursor bool) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.SelectIndex = index
+		e.config.SelectOrderBy = orderBy
+		e.config.SelectCursor = cursor
+	}
+}
+
+// WithPreflight enables EXPLAIN preflight with large-table confirmation.
+// threshold <= 0 falls back to the default; autoConfirm=true skips the
+// interactive confirmation (SDK callers typically set this true).
+func WithPreflight(threshold int64, autoConfirm bool) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.PreflightThreshold = threshold
+		e.config.AutoConfirm = autoConfirm
+	}
+}
+
+// WithMaxRows sets the maximum number of rows to act on (0 = unlimited).
+func WithMaxRows(maxRows int64) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.MaxRows = maxRows
+	}
+}
+
+// WithMaxDuration sets the maximum run time in milliseconds (0 = unlimited).
+func WithMaxDuration(maxDurationMs int64) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.MaxDuration = maxDurationMs
+	}
+}
+
+// WithDryRun enables dry-run mode (prints sample SQL, does not execute).
+func WithDryRun(enabled bool) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.DryRun = enabled
+	}
+}
+
 func NewExecutor(config *conf.Config, opts ...Option) (*Executor, error) {
 	if config == nil {
 		return nil, fmt.Errorf("config is nil")
@@ -65,6 +126,17 @@ func NewExecutor(config *conf.Config, opts ...Option) (*Executor, error) {
 			return nil, fmt.Errorf("init logger failed: %w", err)
 		}
 	}
+	executor := &Executor{
+		config:           config,
+		progressInterval: 3 * time.Second,
+	}
+
+	// Apply options first so config-mutating options (WithOBCovering,
+	// WithPreflight, WithDryRun, ...) are visible to PreCheck and NewWriter.
+	for _, opt := range opts {
+		opt(executor)
+	}
+
 	if err := config.PreCheck(); err != nil {
 		return nil, err
 	}
@@ -73,17 +145,7 @@ func NewExecutor(config *conf.Config, opts ...Option) (*Executor, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	executor := &Executor{
-		config:           config,
-		rateLimiter:      task.NewRateLimiterFromConfig(config),
-		writer:           writer,
-		progressInterval: 3 * time.Second,
-	}
-
-	for _, opt := range opts {
-		opt(executor)
-	}
+	executor.writer = writer
 
 	if executor.rateLimiter == nil {
 		executor.rateLimiter = task.NewRateLimiterFromConfig(config)

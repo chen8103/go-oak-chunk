@@ -3,6 +3,7 @@ package conf
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pelletier/go-toml"
 
@@ -30,6 +31,18 @@ type Config struct {
 	Database string `toml:"database"`
 	TxnSize  int64  `toml:"txn_size"`
 	Debug    bool   `toml:"debug_mode"`
+
+	// P2: OB covering-index fast-path (DELETE only, single worker).
+	SelectIndex   string `toml:"select_index"`    // optional FORCE INDEX name
+	SelectOrderBy string `toml:"select_order_by"` // order columns (comma-separated)
+	SelectCursor  bool   `toml:"select_cursor"`   // advance via cursor, avoid re-scan
+
+	// P2: shared guardrails and preflight.
+	MaxRows            int64 `toml:"max_rows"`            // max rows to act on (0=unlimited)
+	MaxDuration        int64 `toml:"max_duration_ms"`     // max run time in ms (0=unlimited)
+	DryRun             bool  `toml:"dry_run"`             // print sample SQL, do not execute
+	PreflightThreshold int64 `toml:"preflight_threshold"` // EXPLAIN confirm threshold (0=default)
+	AutoConfirm        bool  `toml:"auto_confirm"`        // skip large-table confirmation
 
 	// 修正
 	Correct int64 `toml:"correct"`
@@ -71,5 +84,66 @@ func (c *Config) PreCheck() error {
 		return fmt.Errorf("--include-slaves and --exclude-slaves are mutually exclusive")
 	}
 
+	// P2: covering-index fast-path dependency / mutual-exclusion checks.
+	fastPath := strings.TrimSpace(c.SelectOrderBy) != ""
+	if fastPath {
+		sqlType, err := ParseSQLType(c.ExecuteQuery)
+		if err != nil {
+			return fmt.Errorf("--select-order-by requires a parseable DELETE/UPDATE: %w", err)
+		}
+		if sqlType != SQLTypeDelete {
+			return fmt.Errorf(
+				"--select-order-by (covering index fast-path) requires DELETE, got %s",
+				sqlType,
+			)
+		}
+	}
+	if c.SelectCursor && !fastPath {
+		return fmt.Errorf("--select-cursor requires --select-order-by")
+	}
+	if strings.TrimSpace(c.SelectIndex) != "" && !fastPath {
+		return fmt.Errorf("--select-index requires --select-order-by")
+	}
+
+	if c.MaxRows < 0 {
+		return fmt.Errorf("--max-rows must be >= 0 (0=unlimited)")
+	}
+	if c.MaxDuration < 0 {
+		return fmt.Errorf("--max-duration-ms must be >= 0 (0=unlimited)")
+	}
+	// max-rows / max-duration are only enforced on the covering-index fast-path
+	// in P2; reject them on the default range path rather than silently ignoring.
+	if !fastPath && (c.MaxRows > 0 || c.MaxDuration > 0) {
+		return fmt.Errorf(
+			"--max-rows/--max-duration-ms are currently only enforced with the " +
+				"--select-order-by fast-path",
+		)
+	}
+	if c.PreflightThreshold < 0 {
+		return fmt.Errorf("--preflight-threshold must be >= 0 (0=default)")
+	}
+
 	return nil
+}
+
+// SQL operation types recognised by ParseSQLType.
+const (
+	SQLTypeDelete = "DELETE"
+	SQLTypeUpdate = "UPDATE"
+)
+
+// ParseSQLType performs a lightweight prefix classification of the execute
+// query into DELETE or UPDATE. It intentionally avoids a full parse (the
+// Writer does the authoritative AST parse later); this is only used to gate the
+// fast-path before a DB connection exists.
+func ParseSQLType(query string) (string, error) {
+	upper := strings.ToUpper(strings.TrimSpace(query))
+	switch {
+	case strings.HasPrefix(upper, "DELETE"):
+		return SQLTypeDelete, nil
+	case strings.HasPrefix(upper, "UPDATE"):
+		return SQLTypeUpdate, nil
+	default:
+		return "", fmt.Errorf("unsupported SQL type (expected UPDATE or DELETE)")
+	}
 }
