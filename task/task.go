@@ -117,19 +117,16 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 		log.Logger.Debug("getStopTime goroutine is finished")
 	}()
 
-	readErrChan := make(chan error, 1)
-	p := mysql.NewProcedure(runCtx, writer)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		readErrChan <- p.BuildSQL(writer.ProducerQueue)
-	}()
+	strategy := selectStrategy(writer)
 
-	writeErrChan := make(chan error, 1)
+	executeErrChan := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writeErrChan <- writer.Write(runCtx, rateLimiter.Bucket(), bucketNum)
+		executeErrChan <- strategy.Run(runCtx, mysql.RunParams{
+			Bucket:    rateLimiter.Bucket(),
+			BucketNum: bucketNum,
+		})
 	}()
 
 	tasksDoneChan := make(chan struct{}, 1)
@@ -167,24 +164,15 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 				return ErrExecutionStopped
 			}
 			return ctx.Err()
-		case readErr := <-readErrChan:
-			if readErr != nil {
-				readErr = normalizeStopError(readErr)
+		case execErr := <-executeErrChan:
+			if execErr != nil {
+				execErr = normalizeStopError(execErr)
 				deferCancelOnce.Do(cancel)
 				cleanup()
 				waitProgressDone()
-				return readErr
+				return execErr
 			}
-			readErrChan = nil
-		case writeErr := <-writeErrChan:
-			if writeErr != nil {
-				writeErr = normalizeStopError(writeErr)
-				deferCancelOnce.Do(cancel)
-				cleanup()
-				waitProgressDone()
-				return writeErr
-			}
-			writeErrChan = nil
+			executeErrChan = nil
 		case <-tasksDoneChan:
 			deferCancelOnce.Do(cancel)
 			cleanup()
@@ -192,6 +180,13 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 			return nil
 		}
 	}
+}
+
+// selectStrategy 根据配置选择执行策略。
+// P1: 行为零变化, 仅有 RangeStrategy(现有 pt-archiver 范围分块)。
+// 未来可扩展为根据 config / writer 元信息 switch 多策略。
+func selectStrategy(writer *mysql.Writer) mysql.ChunkStrategy {
+	return mysql.NewRangeStrategy(writer)
 }
 
 func getStopTime(ctx context.Context, sl *lag_checker.SlaveChecker, bucketNum chan int64, rateLimiter *RateLimiter, writer *mysql.Writer) {

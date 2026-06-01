@@ -10,9 +10,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	soar "github.com/XiaoMi/soar/ast"
-	"github.com/juju/ratelimit"
-	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
+	_ "github.com/pingcap/tidb/parser/test_driver"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/internal/retry"
@@ -136,7 +136,7 @@ func (w *Writer) preCheck(c *conf.Config) error {
 	return nil
 }
 
-func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum <-chan int64) error {
+func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int64) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -284,7 +284,7 @@ func (w *Writer) tableExists() (bool, error) {
 // fetch index
 func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	// First get sql type, update or delete?
-	sqlStmt, err := soar.TiParse(w.ExecuteSQL, "", "")
+	sqlStmt, _, err := parser.New().ParseSQL(w.ExecuteSQL)
 	if err != nil {
 		return err
 	}
@@ -358,7 +358,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return err
 	}
 
-	tableStmt, err := soar.TiParse(tableMeta, "", "")
+	tableStmt, _, err := parser.New().ParseSQL(tableMeta)
 	if err != nil {
 		return err
 	}
@@ -572,7 +572,7 @@ func buildColumnMetas(tableNode *ast.CreateTableStmt) map[string]columnMeta {
 			}
 		}
 		columnMetas[strings.ToLower(col.Name.Name.String())] = columnMeta{
-			columnType: col.Tp.Tp,
+			columnType: col.Tp.GetType(),
 			isNull:     isNull,
 		}
 	}

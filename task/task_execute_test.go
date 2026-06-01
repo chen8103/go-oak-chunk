@@ -13,7 +13,7 @@ import (
 	"time"
 	"unsafe"
 
-	parser_mysql "github.com/pingcap/parser/mysql"
+	parser_mysql "github.com/pingcap/tidb/parser/mysql"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/mysql"

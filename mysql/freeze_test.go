@@ -5,8 +5,9 @@ import (
 	"testing"
 	"time"
 
-	soar "github.com/XiaoMi/soar/ast"
-	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
+	_ "github.com/pingcap/tidb/parser/test_driver"
 )
 
 func TestFreezeNow_BasicFunctions(t *testing.T) {
@@ -83,9 +84,9 @@ func TestFreezeNow_BasicFunctions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			stmts, err := soar.TiParse(tt.sql, "", "")
+			stmts, _, err := parser.New().ParseSQL(tt.sql)
 			if err != nil {
-				t.Fatalf("TiParse failed: %v", err)
+				t.Fatalf("ParseSQL failed: %v", err)
 			}
 			if len(stmts) == 0 {
 				t.Fatalf("empty parse result")

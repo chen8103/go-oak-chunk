@@ -7,12 +7,11 @@ import (
 	"strconv"
 	"strings"
 
-	soar "github.com/XiaoMi/soar/ast"
-	"github.com/XiaoMi/soar/common"
-	"github.com/pingcap/parser/ast"
-	"github.com/pingcap/parser/format"
-	"github.com/pingcap/parser/mysql"
-	"github.com/tidwall/gjson"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
+	"github.com/pingcap/tidb/parser/format"
+	"github.com/pingcap/tidb/parser/mysql"
+	_ "github.com/pingcap/tidb/parser/test_driver"
 )
 
 type SlaveHost struct {
@@ -147,7 +146,7 @@ func GetPossibleUniqueKeys(tableNode *ast.CreateTableStmt) []*UnqKeys {
 					}
 				}
 
-				unqKey.UniqueKeyTypes = append(unqKey.UniqueKeyTypes, col.Tp.Tp)
+				unqKey.UniqueKeyTypes = append(unqKey.UniqueKeyTypes, col.Tp.GetType())
 				unqKey.IsNull = append(unqKey.IsNull, isNull)
 			}
 		}
@@ -197,27 +196,54 @@ func handleColumnValue(scanArgs []interface{}, cols []string, keyCol string, tp 
 }
 
 func TableMetaInfo(sql string) (string, error) {
-	tree, err := soar.TiParse(sql, "", "")
+	tree, _, err := parser.New().ParseSQL(sql)
 	if err != nil {
 		return "", err
 	}
-
-	jsonString := soar.StmtNode2JSON(sql, "", "")
+	if len(tree) == 0 {
+		return "", errors.New("SQL got wrong : " + sql)
+	}
 
 	node := tree[0]
-	switch node.(type) {
-	// SetOprStmt represents "union/except/intersect statement"
-	case *ast.InsertStmt, *ast.UpdateStmt, *ast.DeleteStmt:
-		// DML/DQL: INSERT, SELECT, UPDATE, DELETE
-		for _, tableRef := range common.JSONFind(jsonString, "TableRefs") {
-			for _, source := range common.JSONFind(tableRef, "Source") {
-				table := gjson.Get(source, "Name.O")
-				return table.String(), nil
-			}
+	var refs *ast.Join
+	switch n := node.(type) {
+	// DML/DQL: INSERT, UPDATE, DELETE
+	case *ast.InsertStmt:
+		if n.Table != nil {
+			refs = n.Table.TableRefs
+		}
+	case *ast.UpdateStmt:
+		if n.TableRefs != nil {
+			refs = n.TableRefs.TableRefs
+		}
+	case *ast.DeleteStmt:
+		if n.TableRefs != nil {
+			refs = n.TableRefs.TableRefs
 		}
 	default:
 		return "", errors.New("Not supported sql type: " + sql)
 	}
 
+	if name := firstTableName(refs); name != "" {
+		return name, nil
+	}
 	return "", errors.New("SQL got wrong : " + sql)
+}
+
+// firstTableName returns the name of the leftmost table referenced in a join
+// tree, mirroring the previous JSON traversal which picked the first
+// TableRefs > Source > Name.O it encountered.
+func firstTableName(node ast.ResultSetNode) string {
+	switch n := node.(type) {
+	case *ast.Join:
+		if name := firstTableName(n.Left); name != "" {
+			return name
+		}
+		return firstTableName(n.Right)
+	case *ast.TableSource:
+		return firstTableName(n.Source)
+	case *ast.TableName:
+		return n.Name.O
+	}
+	return ""
 }
