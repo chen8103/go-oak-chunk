@@ -3,7 +3,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -16,6 +15,7 @@ import (
 	"github.com/pingcap/parser/ast"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/internal/retry"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
@@ -137,8 +137,6 @@ func (w *Writer) preCheck(c *conf.Config) error {
 }
 
 func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum <-chan int64) error {
-	maxRetry := 3
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -210,29 +208,44 @@ func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum 
 					return fmt.Errorf("execute sql failed after %d affected rows in current tx: %w", rowAffects, errEx)
 				}
 
-				var retryErr error
-				for i := 0; i < maxRetry; i++ {
-					tx, retryErr = w.MysqlClient.BeginTx(ctx, nil)
-					if retryErr != nil {
-						return retryErr
+				// 单 chunk 失败时，按错误分类做指数退避重试，每次重试都是独立事务。
+				var finalRes sql.Result
+				retryErr := retry.WithRetry(ctx, retry.DefaultPolicy(), func(attempt int) error {
+					if attempt > 1 {
+						log.Logger.Debugf("retry chunk execution (attempt %d)", attempt)
 					}
 
-					execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-					res, retryErr = tx.ExecContext(execCtx, execSql, values...)
-					cancel()
-					if retryErr != nil {
-						_ = tx.Rollback()
-						if errors.Is(retryErr, context.Canceled) || errors.Is(retryErr, context.DeadlineExceeded) {
-							return retryErr
-						}
-						continue
+					retryTx, txErr := w.MysqlClient.BeginTx(ctx, nil)
+					if txErr != nil {
+						return txErr
 					}
-					break
-				}
+
+					r, execErr := retryTx.ExecContext(ctx, execSql, values...)
+					if execErr != nil {
+						_ = retryTx.Rollback()
+						return execErr
+					}
+
+					if commitErr := retryTx.Commit(); commitErr != nil {
+						_ = retryTx.Rollback()
+						return commitErr
+					}
+
+					finalRes = r
+					return nil
+				})
 
 				if retryErr != nil {
-					return fmt.Errorf("execute sql failed after %d retries: %w", maxRetry, retryErr)
+					return fmt.Errorf("execute chunk sql failed after retry: %w", retryErr)
 				}
+
+				// 重试已在独立事务里提交，外层事务已回滚，重开一个供后续 chunk 使用。
+				tx, err = w.MysqlClient.BeginTx(ctx, nil)
+				if err != nil {
+					return err
+				}
+
+				res = finalRes
 			}
 
 			// 算一下chunk-size和txn-size之间的关系
@@ -282,15 +295,18 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	node := sqlStmt[0]
 	v := &visitor{}
-	switch node.(type) {
+	var whereNode ast.ExprNode
+	switch n := node.(type) {
 	case *ast.DeleteStmt:
 		w.SqlType = "Delete"
 		node.Accept(v)
+		whereNode = n.Where
 
 		w.ExecuteSQL = fmt.Sprintf("DELETE FROM `%s` WHERE ", w.Table)
 	case *ast.UpdateStmt:
 		w.SqlType = "Update"
 		node.Accept(v)
+		whereNode = n.Where
 
 		re := regexp.MustCompile(`set.*where|SET.*WHERE|set.*WHERE|SET.*where`)
 		sub := re.FindString(c.ExecuteQuery)
@@ -300,9 +316,18 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	}
 
 	if v.whereClause != "" {
+		whereClause := v.whereClause
+		// freeze NOW()-like functions so every chunk uses the same timestamp
+		frozenWhere, freezeErr := FreezeNow(whereNode, time.Now())
+		if freezeErr != nil {
+			log.Logger.Warnf("freeze NOW() failed, using original where: %v", freezeErr)
+		} else if frozenWhere != "" {
+			whereClause = frozenWhere
+		}
+
 		// avoid where clause "or", make program confused
-		w.OriginWhereClause = fmt.Sprintf("(%s)", v.whereClause)
-		log.Logger.Debugf("originWhereClause: [%s]", v.whereClause)
+		w.OriginWhereClause = fmt.Sprintf("(%s)", whereClause)
+		log.Logger.Debugf("originWhereClause: [%s]", whereClause)
 
 		w.ExecuteSQL += w.OriginWhereClause
 	}
