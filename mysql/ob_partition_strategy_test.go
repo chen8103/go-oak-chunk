@@ -404,7 +404,6 @@ func TestOBPartitionStrategy_Run_DrainsAllPartitions(t *testing.T) {
 
 func TestOBPartitionStrategy_Run_MaxRowsStops(t *testing.T) {
 	// Many rows per partition; maxRows should halt before draining everything.
-	bigPage := make([][]driver.Value, 2)
 	pages := map[string][][][]driver.Value{}
 	for _, p := range []string{"p0", "p1"} {
 		// 100 full pages -> effectively unbounded for this test.
@@ -417,7 +416,6 @@ func TestOBPartitionStrategy_Run_MaxRowsStops(t *testing.T) {
 		}
 		pages[p] = full
 	}
-	_ = bigPage
 	state := &partFakeState{partitions: []string{"p0", "p1"}, pages: pages}
 	db := newPartTestDB(t, state)
 	ps := newPartitionStrategyWithDB(db, []string{"id"}, []string{"created_at"}, 2)
