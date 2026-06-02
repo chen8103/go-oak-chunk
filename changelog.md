@@ -14,8 +14,11 @@
 #### optimization:
 1. 分区路径 `--max-rows` 精确生效：提交前在锁内按剩余额度预留并裁剪批次，多 worker 合计不超过、零超删
 2. 分区名作为标识符注入 SELECT/DELETE 时做反引号转义（防御性硬化）
-3. 连接池上限随 `--partition-concurrency` 调整，避免并发 worker 抢连接
+3. 连接池上限随 `--partition-concurrency` 调整，始终保留 +2 连接余量（`max(10, 并发数+2)`），避免高并发抢连接
 4. 补全 CLI/SDK 文档参数表与默认值，新增 8 工人并发竞态（`-race`）测试
+
+#### bugFix:
+1. 修复覆盖索引/分区 DELETE 路径每个 chunk 后误用「睡眠令牌桶」做行级限流：原 `Bucket.Wait(affected)` 把删除行数当毫秒数等待（桶为 1 token=1ms），导致 `--sleep 0 --rows-per-sec 0` 时仍每 1000 行 chunk 隐式 sleep ~1 秒，多 worker 共享桶更将整表吞吐压到 ~1000 行/秒。现移除该调用，行级限流统一交给 `--rows-per-sec`（`0`=不限速、跑满速），新增回归测试断言 sleep=0 时不产生行数级等待
 
 ### v3.1.0(20260415)
 #### bugFix:

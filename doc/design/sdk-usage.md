@@ -356,6 +356,12 @@ executor, err := oak.NewExecutor(cfg, oak.WithRateLimiter(rl))
 
 ## 11bis. 行速率上限与守护边界
 
+> **限流原理（两套独立机制）**：每个 chunk 提交后生效，最终节奏取更严格者。
+> - **机制 A（令牌桶）**：管「时间节奏 + 从库保护」，受 `Sleep`/`MaxLag`/`NoConsiderLag`/`Correct` 控制。1 token=1ms；`getStopTime` 协程探测从库延迟并算出应等待的毫秒数喂给消费者，`lag>=MaxLag` 时令消费者暂停 ~1s 等从库追平。
+> - **机制 B（rows-per-sec）**：管「行吞吐上限」，独立 limiter，每批等待 `affected/RowsPerSec` 秒。
+> - 分区并发下两者均**全局共享**，限制全表合计速率。
+> - 完整推导见 CLI 手册 [`cli-usage.md` §9](cli-usage.md)。
+
 ### 11bis.1 `WithRowsPerSec`（全局行速率）
 
 ```go
@@ -366,6 +372,8 @@ oak.NewExecutor(cfg, oak.WithRowsPerSec(50000)) // 也可直接 cfg.RowsPerSec =
 - 每次执行 DML 前按本批行数申请配额，配额不足则等待；三种限流**叠加**生效，最终节奏取决于最严格的那个
 - `0` 表示不限速
 - 该限速器全局共享：分区并行模式下所有 worker 共用，限制的是**全表合计**速率
+
+> 跑满速：`Sleep=0` 且 `RowsPerSec=0`（且无 `MaxLag` 触发）时无任何隐式等待。v3.2.0 修复了覆盖索引/分区 DELETE 每个 chunk 后按行数误等待（~1ms/行）的 bug——此前即使关闭限速也会被压到 ~1000 行/秒。
 
 ### 11bis.2 `WithMaxRows` / `WithMaxDuration`（跑够即停）
 

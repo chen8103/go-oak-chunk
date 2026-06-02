@@ -223,12 +223,27 @@ flowchart TD
 
 ## 9. 限流与从库延迟控制机制
 
-内部使用 1ms 粒度令牌桶，核心受以下参数影响：
+### 9.0 工作原理（两套独立机制）
 
-- `sleep`（毫秒）
-- `max_lag`（秒）
-- `no_consider_lag`
-- `correct`（修正值）
+限流由**两套相互独立**的机制组成，都在「每个 chunk 提交后」生效，最终节奏取决于更严格的那个：
+
+**机制 A：sleep / 从库延迟节流（令牌桶）**——管「时间节奏 + 从库保护」，受 `sleep`、`max_lag`、`no_consider_lag`、`correct` 控制。
+
+- **令牌桶**：1ms 粒度（1 token = 1 毫秒，每秒产 1000 个），token 数即「要等待的毫秒数」。
+- **控制器 `getStopTime` 协程**循环计算应等待的 token 数，通过 `bucketNum` 通道喂给消费者：
+  1. 探测从库延迟 `lag`（`--no-slaves` 或无主从拓扑时跳过）；
+  2. 若 `lag >= max_lag`：推入哨兵值 `LagThreshold(-1)`，自身 sleep 800ms，通知消费者「暂停 ~1s 等从库追平」；
+  3. 否则按 `sleep`/`lag`/`no_consider_lag` 算出 token 数，叠加修正值 `correct`（默认 50，节流时增大、平时衰减，用于吸收机器 1~5ms 计时误差）后推出；
+  4. 自身 sleep「上一 chunk 耗时 × 5/4」（自适应轮询间隔）。
+- **消费者**（Writer / 覆盖 / 分区策略）每个 chunk 前非阻塞取 `bucketNum` 最新值：`-1` → 暂停 ~1s；`>0` → `Bucket.Wait(n)` 等 n 毫秒；`0`（`sleep=0` 且无 lag）→ 不等待。
+
+**机制 B：行速率节流（rows-per-sec）**——管「行吞吐上限」，独立于令牌桶（`task/rows_limiter.go`）。
+
+- 每个 chunk 删/改完后按本批实际行数等待 `affected / rows_per_sec` 秒；`0`=不限速；可被 ctx 取消（SIGINT 立即停）。
+
+**分区并发**下，令牌桶与 rows-per-sec limiter 均为**全局共享**，限制的是**全表合计**速率；从库延迟暂停会广播给所有 worker 一起暂停。
+
+> 取舍速查：要「批次节奏 / 保护从库」用 `--sleep` + `--max-lag`；要「封顶每秒行数」用 `--rows-per-sec`；全关即跑满速。
 
 ### 9.1 sleep 的真实行为
 
@@ -258,6 +273,9 @@ flowchart TD
 - 与 `--sleep`/`--max-lag` **叠加**生效：三者都会让 Writer 等待，最终节奏取决于最严格的那个
 - `--rows-per-sec=0`：不限速（默认）
 - 该限速器是 **全局共享** 的：在分区并行模式下，所有 worker 共用同一个限速器，限制的是**全表合计**的行速率，而不是每个 worker 各自的速率
+
+> 跑满速：`--sleep 0 --rows-per-sec 0`（且无 `--max-lag` 触发）时不会有任何隐式等待，覆盖索引/分区 DELETE 会以数据库能承受的速率执行。
+> （v3.2.0 之前的版本存在一个 bug：这两条路径每个 chunk 后会按删除行数误等待 ~1ms/行，导致即使关闭限速也被压到 ~1000 行/秒，已修复。）
 
 ---
 
