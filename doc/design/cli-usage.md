@@ -96,9 +96,14 @@ go run ./cmd/go-oak-chunk run --help
 | `--debug` | bool / `false` | 否 | 打开 debug 日志 | |
 | `--rows-per-sec` | int64 / `0` | 否 | 全局每秒行数上限 | `0` 表示不限速；与 `--sleep`/`--max-lag` 叠加生效 |
 | `--select-order-by` | string / 空 | 否 | 两阶段候选 SELECT 的排序列（逗号分隔） | 开启覆盖索引快路径（仅 DELETE）；`--partition-concurrency` 的前置条件 |
+| `--select-index` | string / 空 | 否 | 候选 SELECT 的 `FORCE INDEX` 名 | 需配合 `--select-order-by`；不填则交由优化器选择 |
+| `--select-cursor` | bool / `false` | 否 | 用游标推进候选 SELECT，避免每轮从头重扫 | 需配合 `--select-order-by`；大表强烈建议开启 |
 | `--max-rows` | int64 / `0` | 否 | 处理满指定行数后停止 | `0` 表示不限；对 range/covering/partition 三种策略均生效 |
 | `--max-duration-ms` | int64 / `0` | 否 | 运行满指定毫秒后停止 | `0` 表示不限；对三种策略均生效 |
 | `--partition-concurrency` | int / `0` | 否 | OceanBase 专属：分区并行 DELETE 的 worker 数 | `0/1` 关闭；需配合 `--select-order-by` 且表为分区表 |
+| `--dry-run` | bool / `false` | 否 | 只打印样例 SQL，不实际执行 | 用于预览快路径 SELECT/DELETE 形态 |
+| `--preflight-threshold` | int64 / `0` | 否 | EXPLAIN 预估大表确认阈值 | `0` 表示用默认值 `100000` |
+| `--yes` | bool / `false` | 否 | 跳过大表确认交互 | SDK/非交互场景建议开启 |
 
 ---
 
@@ -141,10 +146,15 @@ go run ./cmd/go-oak-chunk run --help
 | `txn_size` | `--txn-size` | 事务大小 |
 | `debug_mode` | `--debug` | debug 模式 |
 | `rows_per_sec` | `--rows-per-sec` | 全局每秒行数上限（`0`=不限） |
-| `select_order_by` | `--select-order-by` | 覆盖索引快路径排序列 |
+| `select_order_by` | `--select-order-by` | 覆盖索引快路径排序列（默认空=关闭） |
+| `select_index` | `--select-index` | 候选 SELECT 的 FORCE INDEX 名（默认空） |
+| `select_cursor` | `--select-cursor` | 游标推进（默认 `false`；需配合 `select_order_by`） |
 | `max_rows` | `--max-rows` | 处理满行数后停止（`0`=不限） |
 | `max_duration_ms` | `--max-duration-ms` | 运行满毫秒后停止（`0`=不限） |
 | `partition_concurrency` | `--partition-concurrency` | OceanBase 分区并行 worker 数（`0/1`=关闭） |
+| `dry_run` | `--dry-run` | 只打印样例 SQL（默认 `false`） |
+| `preflight_threshold` | `--preflight-threshold` | 大表确认阈值（`0`=默认 `100000`） |
+| `auto_confirm` | `--yes` | 跳过大表确认（默认 `false`） |
 | `correct` | 无直接 flag（内部修正值） | 建议维持 `50` |
 | `no_log_bin` | 暂无 CLI 暴露 | 当前版本保留字段 |
 
