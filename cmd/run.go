@@ -56,6 +56,9 @@ var (
 	dryRun             bool
 	preflightThreshold int64
 	autoConfirm        bool
+
+	// P3 flags
+	partitionConcurrency int
 )
 
 var runCmd = &cobra.Command{
@@ -107,6 +110,8 @@ var runCmd = &cobra.Command{
 				DryRun:             dryRun,
 				PreflightThreshold: preflightThreshold,
 				AutoConfirm:        autoConfirm,
+
+				PartitionConcurrency: partitionConcurrency,
 			}
 			if err = config.PreCheck(); err != nil {
 				log.Logger.Errorf("config precheck failed [host=%s, database=%s]: %v", host, database, err)
@@ -194,6 +199,10 @@ func initRun() {
 	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print sample SQL without executing")
 	runCmd.Flags().Int64Var(&preflightThreshold, "preflight-threshold", 0, "EXPLAIN large-table confirmation threshold (0=default 100000)")
 	runCmd.Flags().BoolVar(&autoConfirm, "yes", false, "Skip the large-table confirmation prompt")
+
+	// P3: OceanBase partition-parallel covering DELETE.
+	runCmd.Flags().IntVar(&partitionConcurrency, "partition-concurrency", 0,
+		"OceanBase only: run the covering-index DELETE across table partitions with this many parallel workers (0/1=off)")
 
 	rootCmd.AddCommand(runCmd)
 }

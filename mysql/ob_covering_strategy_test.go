@@ -80,7 +80,7 @@ func TestOBCoveringStrategy_BuildSelectSQL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ocs := newCoveringStrategyForTest(tt.pkCols, tt.orderCols, tt.cursor, tt.cursorValues)
-			sql, args := ocs.buildSelectSQL(tt.cursorValues)
+			sql, args := ocs.buildSelectSQL(ocs.defaultTableRef(), tt.cursorValues)
 			for _, want := range tt.wantContains {
 				if !strings.Contains(sql, want) {
 					t.Errorf("SQL missing %q\ngot: %s", want, sql)
@@ -96,7 +96,7 @@ func TestOBCoveringStrategy_BuildSelectSQL(t *testing.T) {
 func TestOBCoveringStrategy_BuildSelectSQL_ForceIndex(t *testing.T) {
 	ocs := newCoveringStrategyForTest([]string{"id"}, []string{"created_at"}, false, nil)
 	ocs.selectIndex = "idx_created_at"
-	sql, _ := ocs.buildSelectSQL(nil)
+	sql, _ := ocs.buildSelectSQL(ocs.defaultTableRef(), nil)
 	if !strings.Contains(sql, "FORCE INDEX (`idx_created_at`)") {
 		t.Errorf("expected FORCE INDEX hint, got: %s", sql)
 	}
@@ -129,7 +129,7 @@ func TestOBCoveringStrategy_BuildDeleteSQL(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			ocs := newCoveringStrategyForTest(tt.pkCols, nil, false, nil)
-			sql, args := ocs.buildDeleteSQL(tt.batch)
+			sql, args := ocs.buildDeleteSQL(ocs.defaultTableRef(), tt.batch)
 			if !strings.Contains(sql, tt.wantContains) {
 				t.Errorf("SQL missing %q\ngot: %s", tt.wantContains, sql)
 			}
@@ -152,7 +152,7 @@ func TestOBCoveringStrategy_BuildDeleteSQL(t *testing.T) {
 // outside the original predicate.
 func TestOBCoveringStrategy_DeleteAlwaysKeepsFrozenWhere(t *testing.T) {
 	ocs := newCoveringStrategyForTest([]string{"id"}, nil, false, nil)
-	sql, _ := ocs.buildDeleteSQL([]pkRow{{pk: []any{1}}})
+	sql, _ := ocs.buildDeleteSQL(ocs.defaultTableRef(), []pkRow{{pk: []any{1}}})
 	if !strings.Contains(sql, "(status = 'active')") {
 		t.Fatalf("frozen where dropped from DELETE: %s", sql)
 	}
@@ -178,7 +178,7 @@ func TestOBCoveringStrategy_CursorAdvancesFromBatchTail(t *testing.T) {
 	}
 
 	// The next SELECT must bind the advanced cursor values.
-	_, args := ocs.buildSelectSQL(ocs.cursorValues)
+	_, args := ocs.buildSelectSQL(ocs.defaultTableRef(), ocs.cursorValues)
 	if len(args) != 2 || args[0] != "2025-01-02" || args[1] != 2 {
 		t.Errorf("next-page args = %v, want [2025-01-02 2]", args)
 	}

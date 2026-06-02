@@ -205,6 +205,22 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 //     SqlType 与依赖关系已在 config.PreCheck 校验。
 //  2. 否则 -> 默认范围分块 RangeStrategy(行为零变化)。
 func selectStrategy(config *conf.Config, writer *mysql.Writer) mysql.ChunkStrategy {
+	// P3: OceanBase partition-parallel covering DELETE. Requires the covering
+	// fast-path (validated in PreCheck) and an OceanBase data source. Whether the
+	// table is actually partitioned is verified at runtime by discoverPartitions.
+	if config.PartitionConcurrency > 1 &&
+		writer.DataSource() == "oceanbase" &&
+		strings.TrimSpace(config.SelectOrderBy) != "" {
+		return mysql.NewOBPartitionStrategy(writer, &mysql.OBPartitionOptions{
+			SelectIndex:   config.SelectIndex,
+			SelectOrderBy: config.SelectOrderBy,
+			SelectCursor:  config.SelectCursor,
+			DryRun:        config.DryRun,
+			MaxRows:       config.MaxRows,
+			MaxDuration:   time.Duration(config.MaxDuration) * time.Millisecond,
+			Concurrency:   config.PartitionConcurrency,
+		})
+	}
 	if strings.TrimSpace(config.SelectOrderBy) != "" {
 		return mysql.NewOBCoveringStrategy(writer, &mysql.OBCoveringOptions{
 			SelectIndex:   config.SelectIndex,

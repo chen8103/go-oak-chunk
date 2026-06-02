@@ -11,7 +11,41 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
 )
+
+func TestNewMysqlClient_PoolSizing(t *testing.T) {
+	tests := []struct {
+		name        string
+		concurrency int
+		wantMax     int
+	}{
+		{"default off", 0, 10},
+		{"one off", 1, 10},
+		{"small concurrency keeps floor", 5, 10},
+		{"large concurrency raises ceiling", 32, 34},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, err := NewMysqlClient(&conf.Config{
+				User:                 "u",
+				Password:             "p",
+				Host:                 "127.0.0.1",
+				Port:                 3306,
+				Database:             "d",
+				PartitionConcurrency: tt.concurrency,
+			})
+			if err != nil {
+				t.Fatalf("NewMysqlClient err: %v", err)
+			}
+			defer db.Close()
+			if got := db.Stats().MaxOpenConnections; got != tt.wantMax {
+				t.Errorf("MaxOpenConnections = %d, want %d", got, tt.wantMax)
+			}
+		})
+	}
+}
 
 type versionRowsPlan struct {
 	version      string

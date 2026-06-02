@@ -108,9 +108,9 @@ func TestPreCheck_NoFastPathStillPasses(t *testing.T) {
 	}
 }
 
-// max-rows / max-duration are only enforced on the fast-path in P2; setting them
-// on the default range path must be rejected, not silently ignored.
-func TestPreCheck_GuardrailsWithoutFastPathRejected(t *testing.T) {
+// P3: max-rows / max-duration are now enforced on the default range path too, so
+// setting them without the fast-path must be accepted (no longer rejected).
+func TestPreCheck_GuardrailsWithoutFastPathAccepted(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		set  func(c *Config)
@@ -121,9 +121,8 @@ func TestPreCheck_GuardrailsWithoutFastPathRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			c := baseConfig()
 			tc.set(c)
-			err := c.PreCheck()
-			if err == nil || !strings.Contains(err.Error(), "--select-order-by fast-path") {
-				t.Fatalf("expected fast-path-required error, got: %v", err)
+			if err := c.PreCheck(); err != nil {
+				t.Fatalf("expected range-path guardrails to pass, got: %v", err)
 			}
 		})
 	}
