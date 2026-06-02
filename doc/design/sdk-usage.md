@@ -356,6 +356,12 @@ executor, err := oak.NewExecutor(cfg, oak.WithRateLimiter(rl))
 
 ## 11bis. 行速率上限与守护边界
 
+> **限流原理（两套独立机制）**：每个 chunk 提交后生效，最终节奏取更严格者。
+> - **机制 A（令牌桶）**：管「时间节奏 + 从库保护」，受 `Sleep`/`MaxLag`/`NoConsiderLag`/`Correct` 控制。1 token=1ms；`getStopTime` 协程探测从库延迟并算出应等待的毫秒数喂给消费者，`lag>=MaxLag` 时令消费者暂停 ~1s 等从库追平。
+> - **机制 B（rows-per-sec）**：管「行吞吐上限」，独立 limiter，每批等待 `affected/RowsPerSec` 秒。
+> - 分区并发下两者均**全局共享**，限制全表合计速率。
+> - 完整推导见 CLI 手册 [`cli-usage.md` §9](cli-usage.md)。
+
 ### 11bis.1 `WithRowsPerSec`（全局行速率）
 
 ```go
