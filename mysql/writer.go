@@ -31,6 +31,7 @@ type Writer struct {
 	Table             string
 	noLogBing         bool
 	unqKeys           *UnqKeys
+	dataSource        dataSourceType
 	ProducerQueue     chan *Producer
 
 	isFinished    atomic.Bool
@@ -354,6 +355,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return err
 	}
 	defer conn.Close()
+	w.dataSource = dataSource
 
 	if dataSource == dataSourceOceanBase {
 		if err = w.enableOceanBaseDDLCompatMode(ctx, conn); err != nil {
@@ -728,6 +730,13 @@ func (w *Writer) unlockTable() error {
 		return fmt.Errorf("unlockTable failed: %w", err)
 	}
 	return nil
+}
+
+// DataSource 返回探测到的数据源类型("oceanbase"|"tidb"|"mysql")。
+// task 包用它判断是否走 OceanBase 分区并发策略, 返回 string 避免反向依赖
+// mysql 包的非导出类型 dataSourceType。元信息探测前为空串。
+func (w *Writer) DataSource() string {
+	return string(w.dataSource)
 }
 
 func (w *Writer) SetFinished() {

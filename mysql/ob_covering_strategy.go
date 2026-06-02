@@ -79,6 +79,12 @@ func (ocs *OBCoveringStrategy) Name() string {
 	return "OBCoveringStrategy"
 }
 
+// defaultTableRef 返回非分区路径的表引用 "`db`.`table`"。
+// 分区并发路径会改用 "`db`.`table` PARTITION (`name`)"。
+func (ocs *OBCoveringStrategy) defaultTableRef() string {
+	return fmt.Sprintf("`%s`.`%s`", ocs.writer.Database, ocs.writer.Table)
+}
+
 // Run implements ChunkStrategy.Run.
 //
 // A producer goroutine runs the candidate-PK SELECT loop; the current goroutine
@@ -112,13 +118,14 @@ func (ocs *OBCoveringStrategy) Run(ctx context.Context, params RunParams) error 
 
 	// The producer owns candidatesChan and closes it when paging finishes; its
 	// terminal error is stored in producerErr (read after the channel drains).
+	tableRef := ocs.defaultTableRef()
 	candidatesChan := make(chan []pkRow, 1)
 	var producerErr error
 	var producerDone sync.WaitGroup
 	producerDone.Add(1)
 	go func() {
 		defer producerDone.Done()
-		producerErr = ocs.selectCandidatePKLoop(runCtx, candidatesChan)
+		producerErr = ocs.selectCandidatePKLoop(runCtx, tableRef, nil, candidatesChan)
 	}()
 
 	// Consume every batch the producer emits. Looping over the channel until it
@@ -149,7 +156,7 @@ func (ocs *OBCoveringStrategy) Run(ctx context.Context, params RunParams) error 
 			if attempt > 1 {
 				log.Logger.Debugf("retry covering delete batch (attempt %d)", attempt)
 			}
-			n, err := ocs.execDeletePKBatch(runCtx, batch)
+			n, err := ocs.execDeletePKBatch(runCtx, tableRef, batch)
 			affected = n
 			return err
 		})
@@ -230,7 +237,7 @@ type pkRow struct {
 // selectCandidatePKLoop is the producer: each iteration SELECTs up to
 // chunk-size candidate rows and sends them downstream. It stops when a batch
 // comes back short (the table tail has been reached) or empty.
-func (ocs *OBCoveringStrategy) selectCandidatePKLoop(ctx context.Context, out chan<- []pkRow) error {
+func (ocs *OBCoveringStrategy) selectCandidatePKLoop(ctx context.Context, tableRef string, startCursor []any, out chan<- []pkRow) error {
 	defer close(out)
 
 	chunkSize := ocs.writer.ChunkSize
@@ -238,7 +245,7 @@ func (ocs *OBCoveringStrategy) selectCandidatePKLoop(ctx context.Context, out ch
 	// pageCursor is owned solely by this producer goroutine; it keeps SELECT
 	// paging forward. The consumer-owned ocs.cursorValues tracks the committed
 	// position separately, so the two goroutines never write the same field.
-	var pageCursor []any
+	pageCursor := startCursor
 	for {
 		select {
 		case <-ctx.Done():
@@ -246,7 +253,7 @@ func (ocs *OBCoveringStrategy) selectCandidatePKLoop(ctx context.Context, out ch
 		default:
 		}
 
-		sqlText, args := ocs.buildSelectSQL(pageCursor)
+		sqlText, args := ocs.buildSelectSQL(tableRef, pageCursor)
 		rows, err := ocs.writer.MysqlClient.QueryContext(ctx, sqlText, args...)
 		if err != nil {
 			if isContextDoneErr(err) {
@@ -286,12 +293,12 @@ func (ocs *OBCoveringStrategy) selectCandidatePKLoop(ctx context.Context, out ch
 // buildSelectSQL builds the candidate SELECT, appending the cursor predicate
 // when enabled. Returned columns are ordered [order-cols..., pk-cols...] with
 // duplicates removed so the scanned row maps cleanly to (order, pk).
-func (ocs *OBCoveringStrategy) buildSelectSQL(cursor []any) (string, []any) {
+func (ocs *OBCoveringStrategy) buildSelectSQL(tableRef string, cursor []any) (string, []any) {
 	var sb strings.Builder
 
 	selectCols := ocs.selectColumns()
 	colList := quoteAndJoin(selectCols)
-	ns := fmt.Sprintf("`%s`.`%s`", ocs.writer.Database, ocs.writer.Table)
+	ns := tableRef
 
 	indexHint := ""
 	if ocs.selectIndex != "" {
@@ -408,12 +415,12 @@ func (ocs *OBCoveringStrategy) findPKIndexes(cols []string) ([]int, error) {
 }
 
 // execDeletePKBatch runs one short transaction deleting the batch by PK IN list.
-func (ocs *OBCoveringStrategy) execDeletePKBatch(ctx context.Context, batch []pkRow) (int64, error) {
+func (ocs *OBCoveringStrategy) execDeletePKBatch(ctx context.Context, tableRef string, batch []pkRow) (int64, error) {
 	if len(batch) == 0 {
 		return 0, nil
 	}
 
-	sqlText, args := ocs.buildDeleteSQL(batch)
+	sqlText, args := ocs.buildDeleteSQL(tableRef, batch)
 	log.Logger.Debugf("covering delete sql: %s", sqlText)
 
 	tx, err := ocs.writer.MysqlClient.BeginTx(ctx, nil)
@@ -435,10 +442,10 @@ func (ocs *OBCoveringStrategy) execDeletePKBatch(ctx context.Context, batch []pk
 
 // buildDeleteSQL builds "DELETE FROM <t> WHERE <frozen-where> AND (<pk>) IN (...)".
 // Single-column PK uses a flat IN list; composite PK uses row-value tuples.
-func (ocs *OBCoveringStrategy) buildDeleteSQL(batch []pkRow) (string, []any) {
+func (ocs *OBCoveringStrategy) buildDeleteSQL(tableRef string, batch []pkRow) (string, []any) {
 	var sb strings.Builder
 
-	ns := fmt.Sprintf("`%s`.`%s`", ocs.writer.Database, ocs.writer.Table)
+	ns := tableRef
 	pkCols := ocs.writer.unqKeys.UniqueKeyColumns
 	pkColList := quoteAndJoin(pkCols)
 
@@ -473,7 +480,8 @@ func (ocs *OBCoveringStrategy) buildDeleteSQL(batch []pkRow) (string, []any) {
 
 // PrintDryRunSample logs a sample SELECT and DELETE without executing them.
 func (ocs *OBCoveringStrategy) PrintDryRunSample() error {
-	selectSQL, selectArgs := ocs.buildSelectSQL(ocs.cursorValues)
+	tableRef := ocs.defaultTableRef()
+	selectSQL, selectArgs := ocs.buildSelectSQL(tableRef, ocs.cursorValues)
 	log.Logger.Infof("[DRY-RUN] sample SELECT:\n%s\nargs: %v", selectSQL, selectArgs)
 
 	pkCols := ocs.writer.unqKeys.UniqueKeyColumns
@@ -485,7 +493,7 @@ func (ocs *OBCoveringStrategy) PrintDryRunSample() error {
 		}
 		sample = append(sample, pkRow{pk: pk})
 	}
-	deleteSQL, deleteArgs := ocs.buildDeleteSQL(sample)
+	deleteSQL, deleteArgs := ocs.buildDeleteSQL(tableRef, sample)
 	log.Logger.Infof("[DRY-RUN] sample DELETE (3 rows):\n%s\nargs: %v", deleteSQL, deleteArgs)
 	return nil
 }

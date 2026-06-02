@@ -38,6 +38,9 @@ type Config struct {
 	SelectOrderBy string `toml:"select_order_by"` // order columns (comma-separated)
 	SelectCursor  bool   `toml:"select_cursor"`   // advance via cursor, avoid re-scan
 
+	// P3: OceanBase partition-parallel covering DELETE.
+	PartitionConcurrency int `toml:"partition_concurrency"` // >1 enables OB partition-parallel covering DELETE; 0/1=off
+
 	// P2: shared guardrails and preflight.
 	MaxRows            int64 `toml:"max_rows"`            // max rows to act on (0=unlimited)
 	MaxDuration        int64 `toml:"max_duration_ms"`     // max run time in ms (0=unlimited)
@@ -112,14 +115,23 @@ func (c *Config) PreCheck() error {
 	if c.MaxDuration < 0 {
 		return fmt.Errorf("--max-duration-ms must be >= 0 (0=unlimited)")
 	}
-	// max-rows / max-duration are only enforced on the covering-index fast-path
-	// in P2; reject them on the default range path rather than silently ignoring.
-	if !fastPath && (c.MaxRows > 0 || c.MaxDuration > 0) {
+	// P3: max-rows / max-duration are now enforced on both the range path and the
+	// covering fast-path, so the earlier fast-path-only restriction is removed.
+
+	// P3: partition concurrency is OceanBase-only and requires the covering
+	// DELETE fast-path (--select-order-by). The authoritative "is the table
+	// partitioned / is this OceanBase" check happens at runtime once a DB
+	// connection exists; here we only validate the flag dependencies.
+	if c.PartitionConcurrency < 0 {
+		return fmt.Errorf("--partition-concurrency must be >= 0 (0/1=off)")
+	}
+	if c.PartitionConcurrency > 1 && !fastPath {
 		return fmt.Errorf(
-			"--max-rows/--max-duration-ms are currently only enforced with the " +
-				"--select-order-by fast-path",
+			"--partition-concurrency requires the covering-index fast-path " +
+				"(--select-order-by, DELETE only)",
 		)
 	}
+
 	if c.PreflightThreshold < 0 {
 		return fmt.Errorf("--preflight-threshold must be >= 0 (0=default)")
 	}

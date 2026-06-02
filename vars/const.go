@@ -15,6 +15,17 @@ const (
 	UnlockTableSQL = "UNLOCK TABLES"
 
 	FirstSQL = "select /*!40001 SQL_NO_CACHE */ %s from %s where %s"
+
+	// PartitionsSQL lists the partition names of a table in ordinal order
+	// (OceanBase / MySQL information_schema). Non-partitioned tables return
+	// no rows (PARTITION_NAME IS NULL).
+	PartitionsSQL = `
+        SELECT PARTITION_NAME
+        FROM information_schema.PARTITIONS
+        WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = ?
+            AND PARTITION_NAME IS NOT NULL
+        ORDER BY PARTITION_ORDINAL_POSITION`
 )
 
 const (

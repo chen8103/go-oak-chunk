@@ -117,6 +117,19 @@ func WithRowsPerSec(rowsPerSec int64) Option {
 	}
 }
 
+// WithPartitionConcurrency enables the OceanBase partition-parallel covering
+// DELETE with n workers (0/1 = off). Requires the covering fast-path
+// (--select-order-by); validated in NewExecutor's config.PreCheck. The table
+// being actually partitioned is verified at runtime.
+func WithPartitionConcurrency(n int) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.PartitionConcurrency = n
+	}
+}
+
 // WithDryRun enables dry-run mode (prints sample SQL, does not execute).
 func WithDryRun(enabled bool) Option {
 	return func(e *Executor) {

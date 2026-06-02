@@ -30,6 +30,18 @@ func TestSelectStrategy(t *testing.T) {
 			config:   &conf.Config{SelectOrderBy: "  "},
 			wantName: "RangeStrategy",
 		},
+		{
+			// PartitionConcurrency>1 + fast-path but non-OceanBase data source
+			// (empty DataSource() on the bare Writer) must fall back to covering.
+			name:     "partition concurrency without oceanbase falls back to covering",
+			config:   &conf.Config{SelectOrderBy: "created_at", PartitionConcurrency: 4},
+			wantName: "OBCoveringStrategy",
+		},
+		{
+			name:     "partition concurrency <=1 stays covering",
+			config:   &conf.Config{SelectOrderBy: "created_at", PartitionConcurrency: 1},
+			wantName: "OBCoveringStrategy",
+		},
 	}
 
 	for _, tt := range tests {
