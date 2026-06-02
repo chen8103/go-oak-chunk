@@ -45,6 +45,7 @@ var (
 	debug         bool
 	noConsiderLag bool
 	maxLag        int64
+	rowsPerSec    int64
 
 	// P2 flags
 	selectIndex        string
@@ -95,6 +96,7 @@ var runCmd = &cobra.Command{
 				Debug:         debug,
 				NoConsiderLag: noConsiderLag,
 				TxnSize:       txnSize,
+				RowsPerSec:    rowsPerSec,
 				Correct:       50,
 
 				SelectIndex:        selectIndex,
@@ -181,6 +183,7 @@ func initRun() {
 	runCmd.Flags().Int64Var(&txnSize, "txn-size", 1000, "Number of rows per transaction.")
 	runCmd.Flags().Int64Var(&maxLag, "max-lag", 0, "Pause chunk dml if the slave reach Threshold.")
 	runCmd.Flags().BoolVar(&debug, "debug", false, "If debug_mode is true, print debug logs")
+	runCmd.Flags().Int64Var(&rowsPerSec, "rows-per-sec", 0, "Cap rows acted on per second (0=unlimited)")
 
 	// P2: OB covering-index fast-path (DELETE only) and shared guardrails.
 	runCmd.Flags().StringVar(&selectIndex, "select-index", "", "FORCE INDEX name for the two-phase candidate SELECT (covering index strategy)")

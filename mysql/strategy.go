@@ -34,10 +34,21 @@ type RunParams struct {
 
 	// BucketNum 是限流信号通道, 由 task.getStopTime 写入。
 	BucketNum <-chan int64
+
+	// RowsLimiter 是行级限流器(rows/sec), 在每次事务/批次提交后等待。
+	// 用接口而非具体类型, 让 mysql 包不直接依赖 task 包的限流实现。
+	// nil 表示不限流(调用点需判空)。
+	RowsLimiter RowsLimiter
 }
 
 // Bucket 抽象令牌桶的最小接口(对标 juju/ratelimit.Bucket.Wait)。
 // 用接口而非具体类型, 让 mysql 包不直接依赖限流实现。
 type Bucket interface {
 	Wait(count int64)
+}
+
+// RowsLimiter 抽象行级限流器的最小接口(对标 task.RowsLimiter.Wait)。
+// 用接口而非具体类型, 让 mysql 包不直接依赖 task 包的限流实现。
+type RowsLimiter interface {
+	Wait(ctx context.Context, rows int64) error
 }

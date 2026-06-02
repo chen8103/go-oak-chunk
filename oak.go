@@ -107,6 +107,16 @@ func WithMaxDuration(maxDurationMs int64) Option {
 	}
 }
 
+// WithRowsPerSec sets the per-second row cap (0 = unlimited).
+func WithRowsPerSec(rowsPerSec int64) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.RowsPerSec = rowsPerSec
+	}
+}
+
 // WithDryRun enables dry-run mode (prints sample SQL, does not execute).
 func WithDryRun(enabled bool) Option {
 	return func(e *Executor) {

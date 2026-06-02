@@ -276,7 +276,7 @@ func TestWriterWrite_RetryAndCancellationRisks(t *testing.T) {
 
 			errCh := make(chan error, 1)
 			go func() {
-				errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum)
+				errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
 			}()
 
 			if tt.cancelOnExecCall >= 0 {
@@ -326,7 +326,7 @@ func TestWriterWrite_CancelWhileWaitingProducerRollsBack(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), make(chan int64, 1))
+		errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), make(chan int64, 1), nil)
 	}()
 
 	select {

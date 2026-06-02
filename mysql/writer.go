@@ -136,7 +136,7 @@ func (w *Writer) preCheck(c *conf.Config) error {
 	return nil
 }
 
-func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int64) error {
+func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int64, rowsLimiter RowsLimiter) error {
 	for {
 		select {
 		case <-ctx.Done():
@@ -261,6 +261,14 @@ func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int6
 		}
 		w.AddRowAffects(rowAffects)
 		w.SetCostTime(time.Since(beginTime))
+
+		// 行级限流: 按本事务实际影响行数等待 rows/rowsPerSec 秒。
+		// ctx 取消时按既有的 clean-stop 语义返回 nil。
+		if rowsLimiter != nil {
+			if err = rowsLimiter.Wait(ctx, rowAffects); err != nil {
+				return nil
+			}
+		}
 
 		// finish flag
 		if shouldFinish || w.IsFinished() {

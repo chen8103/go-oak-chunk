@@ -91,6 +91,8 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 		rateLimiter = NewRateLimiterFromConfig(config)
 	}
 
+	rowsLimiter := NewRowsLimiterFromConfig(config)
+
 	progressInterval := opts.ProgressInterval
 	if progressInterval <= 0 {
 		progressInterval = 3 * time.Second
@@ -137,8 +139,9 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 	go func() {
 		defer wg.Done()
 		executeErrChan <- strategy.Run(runCtx, mysql.RunParams{
-			Bucket:    rateLimiter.Bucket(),
-			BucketNum: bucketNum,
+			Bucket:      rateLimiter.Bucket(),
+			BucketNum:   bucketNum,
+			RowsLimiter: rowsLimiter,
 		})
 	}()
 

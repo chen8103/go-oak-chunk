@@ -167,6 +167,16 @@ func (ocs *OBCoveringStrategy) Run(ctx context.Context, params RunParams) error 
 		ocs.writer.SetCostTime(time.Since(beginTime))
 		params.Bucket.Wait(affected)
 
+		// 行级限流: 按本批次实际删除行数等待。ctx 取消时按 clean-stop 收尾。
+		if params.RowsLimiter != nil {
+			if err := params.RowsLimiter.Wait(runCtx, affected); err != nil {
+				cancel()
+				producerDone.Wait()
+				ocs.finish()
+				return nil
+			}
+		}
+
 		if stopReached() {
 			cancel()
 			producerDone.Wait()
