@@ -370,8 +370,9 @@ func (ps *OBPartitionStrategy) runPartitionWorker(
 		}
 		state.addRows(ps.writer, affected)
 		ps.writer.SetCostTime(time.Since(beginTime))
-		params.Bucket.Wait(affected)
 
+		// sleep/lag 节流已在循环顶部 applyPartitionRateLimit 里按 bucketCount 消费;
+		// 行级限流交给 RowsLimiter, 不能用行数 affected 去 Bucket.Wait(桶 1 token=1ms)。
 		if params.RowsLimiter != nil {
 			if err := params.RowsLimiter.Wait(ctx, affected); err != nil {
 				return nil

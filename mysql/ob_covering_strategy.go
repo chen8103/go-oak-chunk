@@ -172,9 +172,10 @@ func (ocs *OBCoveringStrategy) Run(ctx context.Context, params RunParams) error 
 		}
 		ocs.writer.AddRowAffects(affected)
 		ocs.writer.SetCostTime(time.Since(beginTime))
-		params.Bucket.Wait(affected)
 
 		// 行级限流: 按本批次实际删除行数等待。ctx 取消时按 clean-stop 收尾。
+		// 注意: sleep/lag 节流已在循环顶部 applyRateLimit 里按 bucketCount 消费,
+		// 这里不能再用行数 affected 去 Bucket.Wait(桶 1 token=1ms), 否则等于每行睡 1ms。
 		if params.RowsLimiter != nil {
 			if err := params.RowsLimiter.Wait(runCtx, affected); err != nil {
 				cancel()
