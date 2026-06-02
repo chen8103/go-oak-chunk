@@ -315,6 +315,71 @@ type noopBucket struct{}
 
 func (noopBucket) Wait(int64) {}
 
+// countingBucket records every token count passed to Wait so a test can assert
+// the strategy never throttles by row count when sleep/rows-per-sec are off.
+type countingBucket struct {
+	mu      sync.Mutex
+	total   int64
+	maxOnce int64
+}
+
+func (b *countingBucket) Wait(n int64) {
+	b.mu.Lock()
+	b.total += n
+	if n > b.maxOnce {
+		b.maxOnce = n
+	}
+	b.mu.Unlock()
+}
+
+func TestOBCoveringStrategy_Run_NoRowCountThrottle(t *testing.T) {
+	// sleep=0 (bucketNum=0) and no RowsLimiter: the strategy must not feed the
+	// row count into Bucket.Wait (the bucket is a 1-token-per-ms SLEEP bucket;
+	// Wait(affected) would sleep ~affected ms per chunk). Regression for the
+	// covering/partition throughput bug.
+	pages := [][][]driver.Value{
+		{{[]byte("2025-01-01"), []byte("1")}, {[]byte("2025-01-02"), []byte("2")}},
+		{{[]byte("2025-01-03"), []byte("3")}},
+	}
+	db, _ := newCoveringTestDB(t, pages)
+
+	ocs := &OBCoveringStrategy{
+		writer: &Writer{
+			MysqlClient:       db,
+			Database:          "d",
+			Table:             "t",
+			OriginWhereClause: "(id > 0)",
+			ChunkSize:         2,
+			unqKeys:           &UnqKeys{UniqueKeyColumns: []string{"id"}},
+		},
+		selectOrderCols: []string{"created_at"},
+		selectCursor:    true,
+	}
+
+	bucket := &countingBucket{}
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ocs.Run(context.Background(), RunParams{Bucket: bucket, BucketNum: bucketNum})
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned err: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run timed out")
+	}
+
+	bucket.mu.Lock()
+	defer bucket.mu.Unlock()
+	if bucket.total != 0 {
+		t.Errorf("bucket waited %d tokens total, want 0 (no row-count throttle when sleep=0)", bucket.total)
+	}
+}
+
 func TestOBCoveringStrategy_Run_PagesAndEmptyStop(t *testing.T) {
 	// chunk-size 2: a full page (2 rows) then a short page (1 row) stops paging.
 	pages := [][][]driver.Value{
