@@ -1,3 +1,22 @@
+### v3.2.0(20260602)
+#### feature:
+1. NOW() 冻结：执行前将 SQL 中的 `NOW()`/`CURRENT_TIMESTAMP` 等时间函数固化为单一时刻，保证长任务跨 chunk 的时间边界一致（`mysql/freeze.go`）
+2. OceanBase 错误分类 + 指数退避重试：区分可重试/不可重试错误，仅在事务尚未产生行变更时安全重试（`internal/retry`）
+3. 解析器升级：由 soar+pingcap 迁移到 `tidb/parser`，并抽出 `ChunkStrategy` 策略接口，为多策略/并发预留扩展点
+4. 覆盖索引两阶段快路径（仅 DELETE）：先按覆盖索引 SELECT 候选主键、再按主键 `IN` 删除，避免回表；新增 `--select-order-by`/`--select-index`/`--select-cursor`（`OBCoveringStrategy`）
+5. EXPLAIN 预检：执行前预估影响行数，大表触发确认；新增 `--preflight-threshold`/`--yes`（`internal/preflight`）
+6. dry-run：`--dry-run` 只打印样例 SELECT/DELETE，不实际执行
+7. 全局行速率限流：`--rows-per-sec` 在令牌桶（`--sleep`）与从库延迟（`--max-lag`）之外，叠加一个按行的全局速率上限（`0`=不限，`task/rows_limiter.go`）
+8. 执行上限统一生效：`--max-rows`/`--max-duration-ms` 现对 range/covering/partition 三种策略均生效，达到即干净停止（移除 P2 仅快路径可用的临时限制）
+9. OceanBase 分区并行 DELETE：`--partition-concurrency` 自动发现表分区并以 ≤N 个 worker 并行删除，每个 worker 独占分区与游标、按 `PARTITION(...)` 限定范围；限速器全局共享、从库延迟暂停对所有 worker 一起生效（`OBPartitionStrategy`）
+10. SDK 侧新增 `WithOBCovering`/`WithPreflight`/`WithDryRun`/`WithMaxRows`/`WithMaxDuration`/`WithRowsPerSec`/`WithPartitionConcurrency` 选项
+
+#### optimization:
+1. 分区路径 `--max-rows` 精确生效：提交前在锁内按剩余额度预留并裁剪批次，多 worker 合计不超过、零超删
+2. 分区名作为标识符注入 SELECT/DELETE 时做反引号转义（防御性硬化）
+3. 连接池上限随 `--partition-concurrency` 调整，避免并发 worker 抢连接
+4. 补全 CLI/SDK 文档参数表与默认值，新增 8 工人并发竞态（`-race`）测试
+
 ### v3.1.0(20260415)
 #### bugFix:
 1. 修复 OceanBase 场景下仅靠兼容 DDL 无法识别全局唯一键的问题；现在会额外通过 `SHOW INDEX` 发现主键/唯一键候选
