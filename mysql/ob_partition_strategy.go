@@ -33,6 +33,11 @@ type OBPartitionOptions struct {
 // "PARTITION (<name>)") and its own cursor; the rate limiter (juju Bucket +
 // bucketNum lag signal) and the rows-per-sec limiter are shared, so throttling
 // is enforced globally across all workers.
+//
+// max-rows is enforced exactly: before each DELETE a worker reserves budget
+// against maxRows under the shared lock and trims the batch to the granted
+// amount, so the total deleted never exceeds maxRows. A slave-lag pause
+// (vars.LagThreshold) is broadcast to every worker via a shared resumeAt gate.
 type OBPartitionStrategy struct {
 	writer *Writer
 
@@ -198,6 +203,66 @@ func (ps *OBPartitionStrategy) Run(ctx context.Context, params RunParams) error 
 	return nil
 }
 
+// lagPauseDuration is how long all workers pause when a slave-lag signal
+// (vars.LagThreshold) is observed, mirroring the single-worker covering path.
+// It is a var (not const) so tests can shrink it.
+var lagPauseDuration = time.Second
+
+// applyPartitionRateLimit drains the shared bucketNum signal and throttles. A
+// LagThreshold sentinel is broadcast to every worker: the observer sets the
+// shared resumeAt gate, and ALL workers wait until it before their next chunk
+// (unlike cov.applyRateLimit, which only pauses the single worker that drained
+// the sentinel). The non-lag throttle (count>0 -> Bucket.Wait) is unchanged.
+func (ps *OBPartitionStrategy) applyPartitionRateLimit(ctx context.Context, params RunParams, state *partitionRunState) {
+	var bucketCount int64
+	for i := 0; i < len(params.BucketNum); i++ {
+		select {
+		case bucketCount = <-params.BucketNum:
+		default:
+		}
+	}
+	if bucketCount == vars.LagThreshold {
+		log.Logger.Debug("Sleep to let slave eliminate lag (broadcast to all partition workers)")
+		state.signalLag(lagPauseDuration)
+	} else if bucketCount > 0 {
+		params.Bucket.Wait(bucketCount)
+	}
+	// Always honor the shared gate so a lag pause set by any worker fans out.
+	state.waitLagGate(ctx)
+}
+
+// signalLag extends the shared lag gate so every worker pauses until now+d.
+func (s *partitionRunState) signalLag(d time.Duration) {
+	deadline := time.Now().Add(d)
+	s.mu.Lock()
+	if deadline.After(s.resumeAt) {
+		s.resumeAt = deadline
+	}
+	s.mu.Unlock()
+}
+
+// waitLagGate blocks until the shared resumeAt instant, or until ctx is
+// cancelled. It re-reads resumeAt each cycle so a concurrent signalLag extends
+// the pause for everyone.
+func (s *partitionRunState) waitLagGate(ctx context.Context) {
+	for {
+		s.mu.Lock()
+		resumeAt := s.resumeAt
+		s.mu.Unlock()
+		d := time.Until(resumeAt)
+		if d <= 0 {
+			return
+		}
+		t := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+	}
+}
+
 func (ps *OBPartitionStrategy) finish() {
 	ps.writer.SetFinished()
 	log.Logger.Debug("OBPartitionStrategy is finished")
@@ -239,8 +304,9 @@ func (ps *OBPartitionStrategy) runPartitionWorker(
 			return nil
 		}
 
-		// Drain the lag signal and throttle (shared bucket = global rate).
-		cov.applyRateLimit(ctx, params)
+		// Drain the lag signal (shared, broadcast to all workers via resumeAt)
+		// and throttle (shared bucket = global rate).
+		ps.applyPartitionRateLimit(ctx, params, state)
 
 		select {
 		case <-ctx.Done():
@@ -267,6 +333,17 @@ func (ps *OBPartitionStrategy) runPartitionWorker(
 
 		if len(batch) == 0 {
 			return nil
+		}
+
+		// Reserve max-rows budget for this batch and trim the tail beyond it.
+		// budgetExhausted means we are deleting the last allowed prefix and must
+		// stop afterwards. maxRows==0 grants the whole batch (unlimited).
+		grant, budgetExhausted := state.reserveBudget(ps.maxRows, int64(len(batch)))
+		if grant == 0 {
+			return nil
+		}
+		if grant < int64(len(batch)) {
+			batch = batch[:grant]
 		}
 
 		beginTime := time.Now()
@@ -301,6 +378,11 @@ func (ps *OBPartitionStrategy) runPartitionWorker(
 			}
 		}
 
+		// Budget exhausted (we just deleted the last allowed prefix) stop.
+		if budgetExhausted {
+			return nil
+		}
+
 		// A short page means this partition's tail has been reached.
 		if int64(len(batch)) < chunkSize {
 			return nil
@@ -324,7 +406,35 @@ type partitionRunState struct {
 	mu         sync.Mutex
 	started    time.Time
 	rows       int64 // mirror of writer.GetRowAffects() under lock
+	reserved   int64 // max-rows budget claimed by in-flight/finished DELETEs
+	resumeAt   time.Time // shared lag gate: all workers pause until this instant
 	stopReason string
+}
+
+// reserveBudget claims up to want rows of the maxRows budget under the shared
+// lock. It returns the granted count (<= want) and whether the grant exhausts
+// the remaining budget (caller must stop after deleting the granted prefix).
+// maxRows==0 means unlimited: the full want is granted and budget never runs out.
+func (s *partitionRunState) reserveBudget(maxRows, want int64) (grant int64, exhausted bool) {
+	if maxRows <= 0 {
+		return want, false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	remaining := maxRows - s.reserved
+	if remaining <= 0 {
+		s.setStopLocked("max-rows")
+		return 0, true
+	}
+	if want >= remaining {
+		grant = remaining
+		exhausted = true
+		s.setStopLocked("max-rows")
+	} else {
+		grant = want
+	}
+	s.reserved += grant
+	return grant, exhausted
 }
 
 // shouldStop reports whether a guardrail (ctx cancel / max-rows / max-duration)

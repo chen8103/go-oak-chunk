@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 func newPartitionStrategyForTest(pkCols, orderCols []string) *OBPartitionStrategy {
@@ -425,12 +427,51 @@ func TestOBPartitionStrategy_Run_MaxRowsStops(t *testing.T) {
 		t.Fatalf("Run err: %v", err)
 	}
 	got := ps.writer.GetRowAffects()
-	if got < 10 {
-		t.Errorf("rowAffects = %d, want >= 10 (maxRows)", got)
+	// Exact: budget reservation under the shared lock trims each batch to the
+	// remaining max-rows budget, so the total deleted equals maxRows exactly
+	// (the fake DELETE reports affected == len(batch)).
+	if got != 10 {
+		t.Errorf("rowAffects = %d, want exactly 10 (maxRows, exact trim)", got)
 	}
-	// Overshoot bounded by workers*(chunkSize-1). 2 workers, chunk 2 -> +2 max.
-	if got > 10+2*(2-1) {
-		t.Errorf("rowAffects = %d overshoots maxRows budget badly", got)
+	// The DB-side deleted count must also equal maxRows (no over-DELETE).
+	state.mu.Lock()
+	deleted := state.deletedRows
+	state.mu.Unlock()
+	if deleted != 10 {
+		t.Errorf("deletedRows = %d, want exactly 10 (no over-delete)", deleted)
+	}
+}
+
+// maxRows that is not a multiple of chunk-size must still be hit exactly: a
+// batch straddling the budget boundary is trimmed to the remaining budget.
+func TestOBPartitionStrategy_Run_MaxRowsExactNonMultiple(t *testing.T) {
+	pages := map[string][][][]driver.Value{}
+	for _, p := range []string{"p0", "p1", "p2"} {
+		full := make([][][]driver.Value, 0, 100)
+		for i := 0; i < 100; i++ {
+			full = append(full, [][]driver.Value{
+				{[]byte("2025-01-01"), []byte(fmt.Sprintf("%d", i*2+1))},
+				{[]byte("2025-01-02"), []byte(fmt.Sprintf("%d", i*2+2))},
+			})
+		}
+		pages[p] = full
+	}
+	state := &partFakeState{partitions: []string{"p0", "p1", "p2"}, pages: pages}
+	db := newPartTestDB(t, state)
+	ps := newPartitionStrategyWithDB(db, []string{"id"}, []string{"created_at"}, 3)
+	ps.maxRows = 7 // odd, not a multiple of chunkSize=2
+
+	if err := ps.Run(context.Background(), RunParams{Bucket: noopBucket{}, BucketNum: make(chan int64, 1)}); err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+	if got := ps.writer.GetRowAffects(); got != 7 {
+		t.Errorf("rowAffects = %d, want exactly 7", got)
+	}
+	state.mu.Lock()
+	deleted := state.deletedRows
+	state.mu.Unlock()
+	if deleted != 7 {
+		t.Errorf("deletedRows = %d, want exactly 7", deleted)
 	}
 }
 
@@ -449,6 +490,77 @@ func TestOBPartitionStrategy_Run_FirstErrorPropagates(t *testing.T) {
 	err := ps.Run(context.Background(), RunParams{Bucket: noopBucket{}, BucketNum: make(chan int64, 1)})
 	if err == nil || !strings.Contains(err.Error(), "delete pk batch failed") {
 		t.Fatalf("expected delete failure propagation, got: %v", err)
+	}
+}
+
+// TestOBPartitionStrategy_Run_ConcurrentRace spins up multiple workers over
+// many partitions so concurrent SELECT/DELETE and shared-state updates
+// (addRows, reserveBudget, lag gate) actually overlap. Run under -race to
+// detect data races on the shared partitionRunState / writer counters.
+func TestOBPartitionStrategy_Run_ConcurrentRace(t *testing.T) {
+	const (
+		numParts = 8
+		pagesPer = 25 // full pages per partition
+	)
+	pages := map[string][][][]driver.Value{}
+	parts := make([]string, 0, numParts)
+	rowID := 0
+	wantRows := 0
+	for pi := 0; pi < numParts; pi++ {
+		name := fmt.Sprintf("p%d", pi)
+		parts = append(parts, name)
+		full := make([][][]driver.Value, 0, pagesPer+1)
+		for j := 0; j < pagesPer; j++ {
+			rowID++
+			a := rowID
+			rowID++
+			b := rowID
+			full = append(full, [][]driver.Value{
+				{[]byte("2025-01-01"), []byte(fmt.Sprintf("%d", a))},
+				{[]byte("2025-01-02"), []byte(fmt.Sprintf("%d", b))},
+			})
+			wantRows += 2
+		}
+		// Trailing short page (1 row) marks this partition's tail.
+		rowID++
+		full = append(full, [][]driver.Value{
+			{[]byte("2025-01-03"), []byte(fmt.Sprintf("%d", rowID))},
+		})
+		wantRows++
+		pages[name] = full
+	}
+
+	state := &partFakeState{partitions: parts, pages: pages}
+	db := newPartTestDB(t, state)
+	ps := newPartitionStrategyWithDB(db, []string{"id"}, []string{"created_at"}, numParts)
+
+	// Shrink the shared lag pause so the test exercises the gate without a
+	// 1s real-time stall; restore after.
+	orig := lagPauseDuration
+	lagPauseDuration = 5 * time.Millisecond
+	t.Cleanup(func() { lagPauseDuration = orig })
+
+	// A non-blocking lag signal channel; feed a couple of LagThreshold sentinels
+	// to exercise the shared lag gate under contention.
+	bucketNum := make(chan int64, 4)
+	bucketNum <- vars.LagThreshold
+	bucketNum <- 0
+
+	if err := ps.Run(context.Background(), RunParams{Bucket: noopBucket{}, BucketNum: bucketNum}); err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+
+	state.mu.Lock()
+	deleted := state.deletedRows
+	state.mu.Unlock()
+	if deleted != wantRows {
+		t.Errorf("deletedRows = %d, want %d (all partitions drained)", deleted, wantRows)
+	}
+	if got := ps.writer.GetRowAffects(); int(got) != wantRows {
+		t.Errorf("rowAffects = %d, want %d", got, wantRows)
+	}
+	if !ps.writer.IsFinished() {
+		t.Error("expected writer finished")
 	}
 }
 
