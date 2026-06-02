@@ -34,6 +34,12 @@ type Writer struct {
 	dataSource        dataSourceType
 	ProducerQueue     chan *Producer
 
+	// MaxRows 在累计影响行数达到该值后停止(0=不限)。停止发生在事务边界,
+	// 实际影响行数可能溢出 MaxRows 至多一个 txn-size, 与 OBCovering 的粗粒度语义一致。
+	MaxRows int64
+	// MaxDuration 在墙钟时长达到该值后停止(0=不限)。
+	MaxDuration time.Duration
+
 	isFinished    atomic.Bool
 	rowAffects    atomic.Int64
 	costTimeNanos atomic.Int64
@@ -91,6 +97,8 @@ func NewWriter(c *conf.Config) (*Writer, error) {
 		TxnSize:       c.TxnSize,
 		ExecuteSQL:    strings.ReplaceAll(c.ExecuteQuery, ";", ""),
 		ProducerQueue: make(chan *Producer, 1000),
+		MaxRows:       c.MaxRows,
+		MaxDuration:   time.Duration(c.MaxDuration) * time.Millisecond,
 	}
 	w.SetCostTime(1 * time.Second)
 
@@ -138,6 +146,7 @@ func (w *Writer) preCheck(c *conf.Config) error {
 }
 
 func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int64, rowsLimiter RowsLimiter) error {
+	runStart := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -269,6 +278,20 @@ func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int6
 			if err = rowsLimiter.Wait(ctx, rowAffects); err != nil {
 				return nil
 			}
+		}
+
+		// 护栏: max-rows / max-duration 达到后干净停止(置 finish, 不报错),
+		// 与 OBCoveringStrategy.stopReached 语义一致。检查在事务提交后进行,
+		// 因此 max-rows 可能溢出至多一个 txn-size。
+		if w.MaxRows > 0 && w.GetRowAffects() >= w.MaxRows {
+			log.Logger.Infof("max-rows reached (%d), stopping", w.MaxRows)
+			w.SetFinished()
+			return nil
+		}
+		if w.MaxDuration > 0 && time.Since(runStart) >= w.MaxDuration {
+			log.Logger.Infof("max-duration reached (%s), stopping", w.MaxDuration)
+			w.SetFinished()
+			return nil
 		}
 
 		// finish flag

@@ -64,6 +64,10 @@ import (
 | `(*Executor).GetStatus()` | 读取快照状态 | 返回当前已影响行数、耗时、sleep、lag 等 |
 | `oak.WithProgressCallback(cb, interval)` | 注入进度回调 | 回调慢时会跳 tick，避免积压 |
 | `oak.WithRateLimiter(rl)` | 注入自定义限流器 | 可完全接管 sleep/maxLag/noConsiderLag |
+| `oak.WithRowsPerSec(n)` | 设置全局每秒行数上限 | `0`=不限；与 sleep/maxLag 令牌桶叠加 |
+| `oak.WithMaxRows(n)` | 处理满 `n` 行后停止 | `0`=不限；对三种策略均生效 |
+| `oak.WithMaxDuration(ms)` | 运行满 `ms` 毫秒后停止 | `0`=不限；对三种策略均生效 |
+| `oak.WithPartitionConcurrency(n)` | OceanBase 分区并行 DELETE | `0/1`=关闭；需覆盖快路径 + 分区表 |
 
 常见错误：
 
@@ -150,6 +154,11 @@ func main() {
 | `PrintProgress` | `bool` | SDK 通常 `false` | CLI 终端输出模式开关 |
 | `Debug` | `bool` | 按需 | debug 日志 |
 | `Correct` | `int64` | **建议 50** | 限流修正值 |
+| `RowsPerSec` | `int64` | 按需 | 全局每秒行数上限；`0`=不限，与 sleep/maxLag 叠加 |
+| `SelectOrderBy` | `string` | 按需 | 覆盖索引快路径排序列（逗号分隔，仅 DELETE）；`PartitionConcurrency` 的前置条件 |
+| `MaxRows` | `int64` | 按需 | 处理满行数后停止；`0`=不限，对三种策略均生效 |
+| `MaxDuration` | `int64` | 按需 | 运行满毫秒后停止；`0`=不限，对三种策略均生效 |
+| `PartitionConcurrency` | `int` | 按需 | OceanBase 分区并行 DELETE worker 数；`0/1`=关闭 |
 
 ### 6.2 `PreCheck` 会校验什么
 
@@ -338,6 +347,64 @@ executor, err := oak.NewExecutor(cfg, oak.WithRateLimiter(rl))
 
 ---
 
+## 11bis. 行速率上限与守护边界
+
+### 11bis.1 `WithRowsPerSec`（全局行速率）
+
+```go
+oak.NewExecutor(cfg, oak.WithRowsPerSec(50000)) // 也可直接 cfg.RowsPerSec = 50000
+```
+
+- 在令牌桶（`Sleep`）与从库延迟（`MaxLag`）之外，再叠加一个**按行**的全局速率上限
+- 每次执行 DML 前按本批行数申请配额，配额不足则等待；三种限流**叠加**生效，最终节奏取决于最严格的那个
+- `0` 表示不限速
+- 该限速器全局共享：分区并行模式下所有 worker 共用，限制的是**全表合计**速率
+
+### 11bis.2 `WithMaxRows` / `WithMaxDuration`（跑够即停）
+
+```go
+oak.NewExecutor(cfg,
+    oak.WithMaxRows(2000000),      // 累计 200 万行后停止
+    oak.WithMaxDuration(600000),   // 或运行满 10 分钟后停止
+)
+```
+
+- 二者任一触达即停止；`0` 表示不限
+- 早期版本只允许在覆盖快路径上设置，**该限制已移除**：range、covering、partition 三种策略均会强制执行
+- 停止为**粗粒度**：range 在事务 / chunk 边界停，covering 在 chunk 边界停，partition 把本批裁剪到剩余额度后停（`MaxRows` 在多 worker 间精确生效，合计不超过、不超删）
+
+---
+
+## 11ter. OceanBase 分区并行 DELETE（`WithPartitionConcurrency`）
+
+```go
+oak.NewExecutor(cfg,
+    oak.WithOBCovering("", "id", false), // 覆盖快路径，提供 SelectOrderBy
+    oak.WithPartitionConcurrency(4),     // 4 个并行 worker
+    oak.WithRowsPerSec(50000),
+    oak.WithMaxRows(2000000),
+)
+```
+
+生效条件（由 `NewExecutor` 的 `PreCheck` 校验依赖、运行时探测分区）：
+
+- 数据源为 **OceanBase**
+- 走覆盖快路径，即设置了 `SelectOrderBy`（仅 DELETE）
+- 目标表为分区表（运行时通过 `information_schema.PARTITIONS` 探测）
+- `n >= 2` 才启用；`0/1` 退回单 worker 的 covering / range 路径
+
+并发行为：
+
+- worker 数钳制到 `min(配置值, 实际分区数, 内部硬上限 64)`
+- 每个 worker 抢占一个分区、独占游标，DELETE 作用域限定到该分区
+- 连接池上限随并发自动放大（约 `并发数 + 2`）
+- 限速器（令牌桶 + `RowsPerSec`）**全局共享**，限制全表合计速率
+- 从库延迟暂停（`MaxLag` 命中）**全局**生效，所有 worker 一起暂停
+- `MaxRows` 在多 worker 间**精确**生效（合计不超过、零超删），`MaxRows=0` 仍为完全不限
+- 任一 worker 报错取消整个并发组，第一个错误向上返回
+
+---
+
 ## 12. 日志接入策略
 
 SDK 常见三种方式：
@@ -404,6 +471,11 @@ oaklog.NewFromSugaredLogger(sugar)
 | `--exclude-slaves` | `conf.Config.ExcludeSlaves` |
 | `--no-slaves` | `conf.Config.NoSlaves` |
 | `--debug` | `conf.Config.Debug` |
+| `--rows-per-sec` | `conf.Config.RowsPerSec` 或 `oak.WithRowsPerSec()` |
+| `--select-order-by` | `conf.Config.SelectOrderBy` 或 `oak.WithOBCovering()` |
+| `--max-rows` | `conf.Config.MaxRows` 或 `oak.WithMaxRows()` |
+| `--max-duration-ms` | `conf.Config.MaxDuration` 或 `oak.WithMaxDuration()` |
+| `--partition-concurrency` | `conf.Config.PartitionConcurrency` 或 `oak.WithPartitionConcurrency()` |
 | `--print-progress` | CLI 专属终端输出；SDK 用 `WithProgressCallback` 替代 |
 
 ---
