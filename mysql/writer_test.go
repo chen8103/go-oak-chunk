@@ -191,6 +191,96 @@ func enqueueOneBatchAndFinish(w *Writer) {
 	w.ProducerQueue <- &Producer{IsFinished: true}
 }
 
+// enqueueNBatches 在后台 goroutine 里持续投递批次, 避免 ProducerQueue
+// 缓冲满时阻塞测试主协程(消费者在护栏触发后会停止消费)。
+func enqueueNBatches(w *Writer, n int) {
+	go func() {
+		for i := 0; i < n; i++ {
+			select {
+			case w.ProducerQueue <- &Producer{
+				WhereClause: "`id` = ?",
+				CurrentKeyValues: []*KeyValue{
+					{ColumnName: "id", ColumnValue: int64(i + 1)},
+				},
+			}:
+			case <-time.After(3 * time.Second):
+				return
+			}
+		}
+	}()
+}
+
+func TestWriterWrite_MaxRowsStops(t *testing.T) {
+	db, state := newWriterTestDB(t, writerExecPlan{rowsAffected: 1})
+	w := newWriterForTest(db)
+	w.TxnSize = 1 // one row per tx -> guardrail evaluated每个事务后
+	w.MaxRows = 3
+	// 排入远多于 MaxRows 的批次, 且不投递 IsFinished, 确保停止来自护栏。
+	enqueueNBatches(w, 50)
+
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Write(context.Background(),
+			ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on max-rows stop, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting writer.Write to stop on max-rows")
+	}
+
+	if !w.IsFinished() {
+		t.Fatalf("expected writer to be finished after max-rows")
+	}
+	if got := w.GetRowAffects(); got < w.MaxRows {
+		t.Fatalf("expected rowAffects >= MaxRows(%d), got %d", w.MaxRows, got)
+	}
+	// 事务边界停止: 每事务 1 行, 不应溢出超过一个 txn-size。
+	if got := w.GetRowAffects(); got > w.MaxRows {
+		t.Fatalf("expected rowAffects == MaxRows(%d) with txn-size=1, got %d", w.MaxRows, got)
+	}
+	if _, execCalls := snapshotDriverCounters(state); execCalls != int(w.MaxRows) {
+		t.Fatalf("expected exactly %d exec calls, got %d", w.MaxRows, execCalls)
+	}
+}
+
+func TestWriterWrite_MaxDurationStops(t *testing.T) {
+	db, _ := newWriterTestDB(t, writerExecPlan{rowsAffected: 1})
+	w := newWriterForTest(db)
+	w.TxnSize = 1
+	w.MaxDuration = 50 * time.Millisecond
+	enqueueNBatches(w, 100000)
+
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Write(context.Background(),
+			ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on max-duration stop, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting writer.Write to stop on max-duration")
+	}
+
+	if !w.IsFinished() {
+		t.Fatalf("expected writer to be finished after max-duration")
+	}
+}
+
 func snapshotTxState(state *writerDriverState) []*writerTxState {
 	state.mu.Lock()
 	defer state.mu.Unlock()
