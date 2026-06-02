@@ -47,7 +47,7 @@ func (rs *RangeStrategy) Run(ctx context.Context, params RunParams) error {
 	// 消费者: Writer.Write 从 ProducerQueue 消费。
 	writeErr := make(chan error, 1)
 	go func() {
-		writeErr <- rs.writer.Write(runCtx, params.Bucket, params.BucketNum)
+		writeErr <- rs.writer.Write(runCtx, params.Bucket, params.BucketNum, params.RowsLimiter)
 	}()
 
 	// 与原 task.Execute 两协程 + select 的语义一致: 任一侧先出错即返回该错误,

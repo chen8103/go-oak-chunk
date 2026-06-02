@@ -26,6 +26,7 @@ type Config struct {
 	IncludeSlaves       string `toml:"include_slaves"`
 	ExcludeSlaves       string `toml:"exclude_slaves"`
 	NoSlaves            bool   `toml:"no_slaves"`
+	RowsPerSec          int64  `toml:"rows_per_sec"` // row-rate cap (0=unlimited)
 
 	//SkipLockTables      bool   `toml:"skip_lock_tables"`
 	Database string `toml:"database"`
@@ -121,6 +122,9 @@ func (c *Config) PreCheck() error {
 	}
 	if c.PreflightThreshold < 0 {
 		return fmt.Errorf("--preflight-threshold must be >= 0 (0=default)")
+	}
+	if c.RowsPerSec < 0 {
+		return fmt.Errorf("--rows-per-sec must be >= 0 (0=unlimited)")
 	}
 
 	return nil
