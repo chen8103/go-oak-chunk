@@ -134,7 +134,9 @@ func main() {
 
 ### 6.1 关键字段一览
 
-| 字段 | 类型 | 建议 | 说明 |
+> 说明：SDK 直接构造 `conf.Config`，未显式赋值的字段取 Go **零值**（数值=`0`、bool=`false`、string=空），下表“默认/建议”列即按此给出。
+
+| 字段 | 类型 | 默认/建议 | 说明 |
 |---|---|---|---|
 | `ExecuteQuery` | `string` | 必填 | 单条 `UPDATE/DELETE` SQL |
 | `Database` | `string` | 必填 | 当前实现要求非空 |
@@ -144,21 +146,26 @@ func main() {
 | `Password` | `string` | 建议必填 | 密码 |
 | `ChunkSize` | `int64` | `1000` 起步 | 每 chunk 行数；`0` 表示一次性 |
 | `TxnSize` | `int64` | `>= ChunkSize` | 每事务最大处理行数 |
-| `Sleep` | `int64` | 0~800 | 毫秒级节奏控制 |
-| `MaxLag` | `int64` | 0~5 | 从库延迟阈值（秒） |
-| `NoConsiderLag` | `bool` | 按需 | `true` 时不按 lag 放大 sleep |
-| `IncludeSlaves` | `string` | 按需 | 仅监控这些从库 |
-| `ExcludeSlaves` | `string` | 按需 | 排除这些从库 |
-| `NoSlaves` | `bool` | 按需 | 跳过从库检查 |
-| `ForceChunkingColumn` | `string` | 按需 | 强制使用指定唯一键列集；OB 下会额外基于 `SHOW INDEX` 校验，逗号两侧空格会自动忽略 |
-| `PrintProgress` | `bool` | SDK 通常 `false` | CLI 终端输出模式开关 |
-| `Debug` | `bool` | 按需 | debug 日志 |
-| `Correct` | `int64` | **建议 50** | 限流修正值 |
-| `RowsPerSec` | `int64` | 按需 | 全局每秒行数上限；`0`=不限，与 sleep/maxLag 叠加 |
-| `SelectOrderBy` | `string` | 按需 | 覆盖索引快路径排序列（逗号分隔，仅 DELETE）；`PartitionConcurrency` 的前置条件 |
-| `MaxRows` | `int64` | 按需 | 处理满行数后停止；`0`=不限，对三种策略均生效 |
-| `MaxDuration` | `int64` | 按需 | 运行满毫秒后停止；`0`=不限，对三种策略均生效 |
-| `PartitionConcurrency` | `int` | 按需 | OceanBase 分区并行 DELETE worker 数；`0/1`=关闭 |
+| `Sleep` | `int64` | `0`（0~800） | 毫秒级节奏控制 |
+| `MaxLag` | `int64` | `0`（0~5） | 从库延迟阈值（秒）；`0`=不限 |
+| `NoConsiderLag` | `bool` | `false` | `true` 时不按 lag 放大 sleep |
+| `IncludeSlaves` | `string` | 空 | 仅监控这些从库 |
+| `ExcludeSlaves` | `string` | 空 | 排除这些从库 |
+| `NoSlaves` | `bool` | `false` | 跳过从库检查 |
+| `ForceChunkingColumn` | `string` | 空 | 强制使用指定唯一键列集；OB 下会额外基于 `SHOW INDEX` 校验，逗号两侧空格会自动忽略 |
+| `PrintProgress` | `bool` | `false` | CLI 终端输出模式开关 |
+| `Debug` | `bool` | `false` | debug 日志 |
+| `Correct` | `int64` | **建议 50** | 限流修正值（CLI 默认 `50`；SDK 零值为 `0`，建议显式设 `50`） |
+| `RowsPerSec` | `int64` | `0` | 全局每秒行数上限；`0`=不限，与 sleep/maxLag 叠加 |
+| `SelectOrderBy` | `string` | 空 | 覆盖索引快路径排序列（逗号分隔，仅 DELETE）；`PartitionConcurrency` 的前置条件 |
+| `SelectIndex` | `string` | 空 | 候选 SELECT 的 `FORCE INDEX` 名；需配合 `SelectOrderBy` |
+| `SelectCursor` | `bool` | `false` | 游标推进候选 SELECT，避免每轮重扫；需配合 `SelectOrderBy`，大表建议开 |
+| `MaxRows` | `int64` | `0` | 处理满行数后停止；`0`=不限，对三种策略均生效 |
+| `MaxDuration` | `int64` | `0` | 运行满毫秒后停止；`0`=不限，对三种策略均生效 |
+| `PartitionConcurrency` | `int` | `0` | OceanBase 分区并行 DELETE worker 数；`0/1`=关闭 |
+| `DryRun` | `bool` | `false` | 只打印样例 SQL，不实际执行 |
+| `PreflightThreshold` | `int64` | `0` | EXPLAIN 大表确认阈值；`0`=默认 `100000` |
+| `AutoConfirm` | `bool` | `false` | 跳过大表确认；SDK/非交互建议 `true` |
 
 ### 6.2 `PreCheck` 会校验什么
 
