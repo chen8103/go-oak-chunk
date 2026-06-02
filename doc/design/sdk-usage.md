@@ -367,6 +367,8 @@ oak.NewExecutor(cfg, oak.WithRowsPerSec(50000)) // 也可直接 cfg.RowsPerSec =
 - `0` 表示不限速
 - 该限速器全局共享：分区并行模式下所有 worker 共用，限制的是**全表合计**速率
 
+> 跑满速：`Sleep=0` 且 `RowsPerSec=0`（且无 `MaxLag` 触发）时无任何隐式等待。v3.2.0 修复了覆盖索引/分区 DELETE 每个 chunk 后按行数误等待（~1ms/行）的 bug——此前即使关闭限速也会被压到 ~1000 行/秒。
+
 ### 11bis.2 `WithMaxRows` / `WithMaxDuration`（跑够即停）
 
 ```go
