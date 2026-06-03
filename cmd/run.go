@@ -59,6 +59,9 @@ var (
 
 	// P3 flags
 	partitionConcurrency int
+
+	// P4 flags
+	tidbRowID bool
 )
 
 var runCmd = &cobra.Command{
@@ -112,6 +115,7 @@ var runCmd = &cobra.Command{
 				AutoConfirm:        autoConfirm,
 
 				PartitionConcurrency: partitionConcurrency,
+				TiDBRowID:            tidbRowID,
 			}
 			if err = config.PreCheck(); err != nil {
 				log.Logger.Errorf("config precheck failed [host=%s, database=%s]: %v", host, database, err)
@@ -203,6 +207,10 @@ func initRun() {
 	// P3: OceanBase partition-parallel covering DELETE.
 	runCmd.Flags().IntVar(&partitionConcurrency, "partition-concurrency", 0,
 		"OceanBase only: run the covering-index DELETE across table partitions with this many parallel workers (0/1=off)")
+
+	// P4: TiDB _tidb_rowid chunked DELETE.
+	runCmd.Flags().BoolVar(&tidbRowID, "tidb-rowid", false,
+		"TiDB only: chunk DELETE by the hidden _tidb_rowid handle (NONCLUSTERED tables, no PK/UK required)")
 
 	rootCmd.AddCommand(runCmd)
 }

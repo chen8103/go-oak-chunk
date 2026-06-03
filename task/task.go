@@ -201,10 +201,24 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 // selectStrategy 根据配置和 writer 元信息选择执行策略。
 //
 // 决策树(优先级从高到低):
-//  1. config.SelectOrderBy 非空 -> 覆盖索引两阶段 fast-path(DELETE only)。
+//  1. config.TiDBRowID -> TiDB _tidb_rowid 分块 DELETE(NONCLUSTERED 表, 无需 PK/UK)。
+//     适用性(数据源/聚簇性) 由 TiDBRowIDStrategy.Run 在运行时校验。
+//  2. config.PartitionConcurrency>1 + OceanBase + 覆盖快路径 -> OB 分区并行 DELETE。
+//  3. config.SelectOrderBy 非空 -> 覆盖索引两阶段 fast-path(DELETE only)。
 //     SqlType 与依赖关系已在 config.PreCheck 校验。
-//  2. 否则 -> 默认范围分块 RangeStrategy(行为零变化)。
+//  4. 否则 -> 默认范围分块 RangeStrategy(行为零变化)。
 func selectStrategy(config *conf.Config, writer *mysql.Writer) mysql.ChunkStrategy {
+	// P4: TiDB _tidb_rowid chunked DELETE. Explicit opt-in via --tidb-rowid;
+	// the DataSource==tidb / NONCLUSTERED checks need a DB connection and run in
+	// TiDBRowIDStrategy.Run, keeping selectStrategy connection-free.
+	if config.TiDBRowID {
+		return mysql.NewTiDBRowIDStrategy(writer, &mysql.TiDBRowIDOptions{
+			DryRun:      config.DryRun,
+			MaxRows:     config.MaxRows,
+			MaxDuration: time.Duration(config.MaxDuration) * time.Millisecond,
+		})
+	}
+
 	// P3: OceanBase partition-parallel covering DELETE. Requires the covering
 	// fast-path (validated in PreCheck) and an OceanBase data source. Whether the
 	// table is actually partitioned is verified at runtime by discoverPartitions.

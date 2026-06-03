@@ -1,3 +1,12 @@
+### v3.3.0(20260603)
+#### feature:
+1. 新增 TiDB 专属清理策略 `--tidb-rowid`（SDK `WithTiDBRowID`）：按 TiDB 隐藏行句柄 `_tidb_rowid` 分块 DELETE，让**无主键/唯一键**的 TiDB 非聚簇（NONCLUSTERED）表也能高效分批清理（`mysql/tidb_rowid_strategy.go`）
+   - 采用 seek 游标（`WHERE _tidb_rowid > cursor ORDER BY _tidb_rowid LIMIT n`）+ `_tidb_rowid IN (...)` 删除，对 `SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 造成的稀疏 rowid 健壮；游标只在 DELETE 提交后前移，始终复用冻结后的 WHERE
+   - 运行时通过 `information_schema.tables.TIDB_PK_TYPE` 校验适用性，CLUSTERED 表清晰报错（老版本回退到 `_tidb_rowid` 探测）
+   - 仅 DELETE；显式开关，不改 TiDB 默认行为（默认仍走 RangeStrategy）；与覆盖快路径/分区并发/`--force-chunking-column` 互斥
+   - 复用既有 NOW() 冻结、`--max-rows`/`--max-duration-ms` 护栏、`--rows-per-sec`/sleep/lag 限流、重试机制
+2. `internal/retry` 错误分类补充 TiDB 写冲突可重试码：`9007`（write conflict）、`8022`（commit 可安全重试）、`8028`（info schema changed）
+
 ### v3.2.0(20260602)
 #### feature:
 1. NOW() 冻结：执行前将 SQL 中的 `NOW()`/`CURRENT_TIMESTAMP` 等时间函数固化为单一时刻，保证长任务跨 chunk 的时间边界一致（`mysql/freeze.go`）

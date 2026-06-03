@@ -380,6 +380,12 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	defer conn.Close()
 	w.dataSource = dataSource
 
+	if c.TiDBRowID {
+		// _tidb_rowid 模式不依赖 PK/UK, 跳过唯一键解析;
+		// 适用性(NONCLUSTERED) 由 TiDBRowIDStrategy.Run 在运行时校验。
+		return nil
+	}
+
 	if dataSource == dataSourceOceanBase {
 		if err = w.enableOceanBaseDDLCompatMode(ctx, conn); err != nil {
 			return err

@@ -41,6 +41,9 @@ type Config struct {
 	// P3: OceanBase partition-parallel covering DELETE.
 	PartitionConcurrency int `toml:"partition_concurrency"` // >1 enables OB partition-parallel covering DELETE; 0/1=off
 
+	// P4: TiDB _tidb_rowid chunked DELETE (NONCLUSTERED tables, no PK/UK needed).
+	TiDBRowID bool `toml:"tidb_rowid"`
+
 	// P2: shared guardrails and preflight.
 	MaxRows            int64 `toml:"max_rows"`            // max rows to act on (0=unlimited)
 	MaxDuration        int64 `toml:"max_duration_ms"`     // max run time in ms (0=unlimited)
@@ -86,6 +89,39 @@ func (c *Config) PreCheck() error {
 	if c.IncludeSlaves != "" && c.ExcludeSlaves != "" {
 		log.Logger.Error("--include-slaves and --exclude-slaves are mutually exclusive.")
 		return fmt.Errorf("--include-slaves and --exclude-slaves are mutually exclusive")
+	}
+
+	// P4: TiDB _tidb_rowid chunked DELETE. Owns its own routing/path, so it is
+	// mutually exclusive with the covering/partition fast-path and skips PK/UK
+	// resolution (forced chunking column would be silently ignored). Checked
+	// before the fast-path block so the user gets the tidb-rowid-specific
+	// message rather than a confusing "requires --select-order-by".
+	if c.TiDBRowID {
+		sqlType, err := ParseSQLType(c.ExecuteQuery)
+		if err != nil {
+			return fmt.Errorf("--tidb-rowid requires a parseable DELETE: %w", err)
+		}
+		if sqlType != SQLTypeDelete {
+			return fmt.Errorf("--tidb-rowid chunks by _tidb_rowid and requires DELETE, got %s", sqlType)
+		}
+		if strings.TrimSpace(c.SelectOrderBy) != "" {
+			return fmt.Errorf("--tidb-rowid is mutually exclusive with the --select-order-by covering fast-path")
+		}
+		if c.SelectCursor {
+			return fmt.Errorf("--tidb-rowid is mutually exclusive with --select-cursor")
+		}
+		if strings.TrimSpace(c.SelectIndex) != "" {
+			return fmt.Errorf("--tidb-rowid is mutually exclusive with --select-index")
+		}
+		if c.PartitionConcurrency > 1 {
+			return fmt.Errorf("--tidb-rowid is mutually exclusive with --partition-concurrency")
+		}
+		if strings.TrimSpace(c.ForceChunkingColumn) != "" {
+			return fmt.Errorf("--tidb-rowid skips key resolution; --force-chunking-column is not applicable")
+		}
+		if c.ChunkSize <= 0 {
+			return fmt.Errorf("--tidb-rowid requires --chunk-size > 0")
+		}
 	}
 
 	// P2: covering-index fast-path dependency / mutual-exclusion checks.

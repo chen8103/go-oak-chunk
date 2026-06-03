@@ -294,3 +294,95 @@ executor, err := oak.NewExecutor(cfg,
 - **P0**:freeze 单测(各种 NOW 变体)、错误分类单测(对齐 obpurge `classify_test.go`)。
 - **P1**:现有 `oak_test.go` / `mysql/*_test.go` / `task/*_test.go` 全绿即重构成功判据;新增 strategy 接口契约测试。
 - **P2/P3**:OB 真实集群 smoke(参考 obpurge `scripts/m7_smoke_helper.sh` 与 `docs/test/m7-cluster-smoke.md`);并发不重叠区间的属性测试。
+
+---
+
+## 12. TiDB 专属清理(P4,`_tidb_rowid` 分块)
+
+> P0–P3 聚焦 OceanBase。P4 在同一 `ChunkStrategy` 抽象上扩展 TiDB 专属能力,**已落地**(`mysql/tidb_rowid_strategy.go`,SDK `WithTiDBRowID` / CLI `--tidb-rowid`)。
+
+### 12.1 背景与缺口
+
+`go-oak-chunk` 默认 `RangeStrategy` 依赖**可用的主键/唯一键**推进游标;`getInfoFromTable`(`mysql/writer.go`)在解析不出 PK/UK 时**直接报错**(`can't find any index which is primary or unique key`),因此**无主键/唯一键的 TiDB 表根本跑不起来**。
+
+TiDB **非聚簇(NONCLUSTERED)** 表带一个隐藏的 int64 行句柄 `_tidb_rowid`,天然适合做分块键,无需用户 PK。P4 用它补上这个缺口。
+
+| 维度 | 说明 |
+|---|---|
+| 适用 | TiDB **NONCLUSTERED** 表(聚簇表 PK 即句柄,无 `_tidb_rowid`) |
+| 操作 | **仅 DELETE**(与覆盖快路径一致;`_tidb_rowid IN (...)` 删行模型不适用 UPDATE 改值) |
+| 触发 | 显式 `--tidb-rowid`,不改 TiDB 默认行为(默认仍走 `RangeStrategy`) |
+
+### 12.2 能力矩阵补充(接 §1.2)
+
+| 能力 | 来源 | UPDATE | DELETE | 备注 |
+|---|---|---|---|---|
+| TiDB `_tidb_rowid` 分块 | 本项目(参考 TiDB 清理实践) | ❌ | ✅ | DELETE 专属策略;支持无 PK/UK 的 NONCLUSTERED 表 |
+
+### 12.3 策略:TiDBRowIDStrategy
+
+挂在 §3 的 `ChunkStrategy` 接口上,生产者-消费者形态与 `OBCoveringStrategy` 一致,但分块键是单列 `_tidb_rowid`(比覆盖策略的多列元组更简单)。
+
+**算法(seek 游标 + IN 删除)**,每个 chunk 两步,单 worker,游标只在 DELETE 提交后前移:
+
+```sql
+SELECT _tidb_rowid FROM `db`.`t`
+ WHERE <frozen-where> [AND _tidb_rowid > ?]      -- 首批 started=false 不带游标
+ ORDER BY _tidb_rowid LIMIT <chunk-size>;
+DELETE FROM `db`.`t`
+ WHERE <frozen-where> AND _tidb_rowid IN (?,?,...);  -- 精确锁定生产者看到的句柄
+```
+
+- **为何不用 `MIN/MAX` 算术步进**:`SHARD_ROW_ID_BITS` / `AUTO_RANDOM` 会把 rowid 散布到 int64 高位,`MAX-MIN` 可能 ~2^60 而表里只有百万行,算术步进会产生海量空范围。seek 游标对间隙不敏感,且 `_tidb_rowid` 是非聚簇表的句柄(范围扫描而非全表扫)。
+- **始终复用冻结后的 WHERE**(`OriginWhereClause`),DELETE 绝不会触及谓词外的行;`IN` 列表锁定句柄,避免 SELECT/DELETE 间新插入的行被误删。
+- **小/负 rowid**:用 `started bool` 区分「无游标」与「游标==0」,首个小/负 rowid 不被跳过。
+- 复用既有公共能力:NOW() 冻结、`--max-rows`/`--max-duration-ms` 护栏(chunk 边界精确停)、`--rows-per-sec`/sleep/lag 限流、错误分类退避重试。
+
+### 12.4 适用性检测(运行时,需 DB 连接)
+
+放在 `TiDBRowIDStrategy.Run` 内(而非 `PreCheck`,后者无连接):
+
+1. 权威:`SELECT TIDB_PK_TYPE FROM information_schema.tables WHERE TABLE_SCHEMA=? AND TABLE_NAME=?` → `NONCLUSTERED` 可用 / `CLUSTERED` **清晰报错**(不静默回退)。
+2. 兜底:老版本无该列时回退探测 `SELECT _tidb_rowid FROM <t> LIMIT 1`。
+
+### 12.5 键解析旁路
+
+`getInfoFromTable` 在 `--tidb-rowid` 时,于数据源探测之后、唯一键解析之前**提前 return**,跳过 PK/UK 解析(NOW() 冻结与 `OriginWhereClause` 已在此之前完成);`TiDBRowID==false` 时行为逐字节不变。此模式下 `w.unqKeys == nil`,策略从不读它(`unqKeys` 仅 `procedure.go`/RangeStrategy 路径访问,与本模式互斥)。
+
+### 12.6 决策树补充(接 §2.2)
+
+`selectStrategy` 新增**最高优先级**分支:
+
+```
+0. 若 --tidb-rowid → TiDBRowIDStrategy
+     (数据源是否 TiDB / 是否 NONCLUSTERED 在 Run 内校验,保持 selectStrategy 不依赖连接)
+1. --partition-concurrency>1 + OceanBase + 覆盖快路径 → OBPartitionStrategy
+2. --select-order-by → OBCoveringStrategy
+3. 否则 → RangeStrategy
+```
+
+### 12.7 配置 / flag 映射(接 §8)
+
+| CLI flag | conf.Config 字段 | SDK option | 策略 |
+|---|---|---|---|
+| `--tidb-rowid` | `TiDBRowID` | `WithTiDBRowID` | tidb-rowid |
+
+`PreCheck` 新增校验(置于 fast-path 块之前,优先给出 tidb-rowid 专属报错):
+- 要求可解析的 **DELETE**;
+- 与 `--select-order-by` / `--select-cursor` / `--select-index` / `--partition-concurrency>1` / `--force-chunking-column` **互斥**;
+- 要求 `--chunk-size > 0`。
+
+错误分类(§4.2)allow-list 增补 TiDB 写冲突可重试码:`9007`(write conflict)、`8022`(commit 可安全重试)、`8028`(info schema changed)。
+
+### 12.8 风险与边界
+
+1. **CLUSTERED 表**:无 `_tidb_rowid`,`Run` 清晰报错(而非静默回退到会再次失败的 RangeStrategy)。
+2. **AUTO_RANDOM / SHARD_ROW_ID_BITS**:seek 游标对稀疏间隙不敏感;游标用 int64。
+3. **非 TiDB 误用**:若对 MySQL/OB 加 `--tidb-rowid`,适用性检测的 `TIDB_PK_TYPE` 查询或探测会失败并清晰报错。
+4. **UPDATE 不支持**:`PreCheck` 拒绝,模型仅适配删行。
+
+### 12.9 测试
+
+- 单测(`mysql/tidb_rowid_strategy_test.go`,复用覆盖策略的 fake driver):SELECT/DELETE SQL 形态、有/无游标参数、适用性(NONCLUSTERED/CLUSTERED/探测兜底)、游标推进与短页终止、`--max-rows` 边界停、dry-run 零删除、关闭限流时不产生行数级 `Bucket.Wait`(限流 bug 回归)。
+- `selectStrategy` 路由测试、`PreCheck` 互斥测试、`Classify` 新增 TiDB 码用例。
+- 端到端:需真实 TiDB 实例,对 NONCLUSTERED 无 PK 表验证按 rowid 分批删除、游标推进、护栏/限流生效;对 CLUSTERED 表验证清晰报错。
