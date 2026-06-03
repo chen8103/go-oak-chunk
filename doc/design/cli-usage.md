@@ -21,9 +21,13 @@
 
 - 只支持 `UPDATE` / `DELETE`（单条 SQL），按 chunk 分批执行
 - 利用主键/唯一键推进游标，避免全表扫描式批处理
-- 支持从库延迟感知，动态调节节奏
+- 多数据源专属加速（DELETE）：
+  - **OceanBase**：覆盖索引两阶段快路径（`--select-order-by`），可进一步**分区并行**（`--partition-concurrency`）
+  - **TiDB**：按隐藏行句柄 `_tidb_rowid` 分块（`--tidb-rowid`），支持**无主键/唯一键**的 NONCLUSTERED 表
+- 统一限流与守护边界：令牌桶（`--sleep`）+ 全局行速率（`--rows-per-sec`）+ 从库延迟感知（`--max-lag`），`--max-rows` / `--max-duration-ms` 跑够即停
+- 长任务 NOW() 时间冻结、失败错误分类重试（含 OB/TiDB 专属码）
 - 支持运行中进度输出
-- 支持 `SIGINT/SIGTERM` 优雅停止
+- 支持 `SIGINT/SIGTERM` 优雅停止、`--dry-run` 预览、EXPLAIN 大表预检
 - 支持 CPU / Memory profile 输出
 
 ---

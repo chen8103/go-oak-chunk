@@ -24,6 +24,7 @@ SDK 方式适合：
 - 你要统一接入已有日志、监控、配置中心、信号处理
 - 你希望运行中动态调整节奏（例如根据系统负载自动调 sleep）
 - 你需要用代码方式管理任务生命周期（启动/停止/超时/取消）
+- 你要针对特定数据源做加速 DELETE：OceanBase 覆盖索引快路径 / 分区并行（`WithOBCovering` / `WithPartitionConcurrency`）、TiDB 按 `_tidb_rowid` 清理无主键表（`WithTiDBRowID`）
 
 ---
 
