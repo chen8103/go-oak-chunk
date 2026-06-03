@@ -213,7 +213,7 @@ var lagPauseDuration = time.Second
 // shared resumeAt gate, and ALL workers wait until it before their next chunk
 // (unlike cov.applyRateLimit, which only pauses the single worker that drained
 // the sentinel). The non-lag throttle (count>0 -> Bucket.Wait) is unchanged.
-func (ps *OBPartitionStrategy) applyPartitionRateLimit(ctx context.Context, params RunParams, state *partitionRunState) {
+func (ps *OBPartitionStrategy) applyPartitionRateLimit(ctx context.Context, params RunParams, state *partitionRunState) bool {
 	var bucketCount int64
 	for i := 0; i < len(params.BucketNum); i++ {
 		select {
@@ -228,7 +228,8 @@ func (ps *OBPartitionStrategy) applyPartitionRateLimit(ctx context.Context, para
 		params.Bucket.Wait(bucketCount)
 	}
 	// Always honor the shared gate so a lag pause set by any worker fans out.
-	state.waitLagGate(ctx)
+	waited := state.waitLagGate(ctx)
+	return bucketCount == vars.LagThreshold || waited
 }
 
 // signalLag extends the shared lag gate so every worker pauses until now+d.
@@ -244,20 +245,22 @@ func (s *partitionRunState) signalLag(d time.Duration) {
 // waitLagGate blocks until the shared resumeAt instant, or until ctx is
 // cancelled. It re-reads resumeAt each cycle so a concurrent signalLag extends
 // the pause for everyone.
-func (s *partitionRunState) waitLagGate(ctx context.Context) {
+func (s *partitionRunState) waitLagGate(ctx context.Context) bool {
+	waited := false
 	for {
 		s.mu.Lock()
 		resumeAt := s.resumeAt
 		s.mu.Unlock()
 		d := time.Until(resumeAt)
 		if d <= 0 {
-			return
+			return waited
 		}
+		waited = true
 		t := time.NewTimer(d)
 		select {
 		case <-ctx.Done():
 			t.Stop()
-			return
+			return waited
 		case <-t.C:
 		}
 	}
@@ -306,7 +309,9 @@ func (ps *OBPartitionStrategy) runPartitionWorker(
 
 		// Drain the lag signal (shared, broadcast to all workers via resumeAt)
 		// and throttle (shared bucket = global rate).
-		ps.applyPartitionRateLimit(ctx, params, state)
+		if ps.applyPartitionRateLimit(ctx, params, state) {
+			continue
+		}
 
 		select {
 		case <-ctx.Done():
@@ -406,8 +411,8 @@ func cloneAny(src []any) []any {
 type partitionRunState struct {
 	mu         sync.Mutex
 	started    time.Time
-	rows       int64 // mirror of writer.GetRowAffects() under lock
-	reserved   int64 // max-rows budget claimed by in-flight/finished DELETEs
+	rows       int64     // mirror of writer.GetRowAffects() under lock
+	reserved   int64     // max-rows budget claimed by in-flight/finished DELETEs
 	resumeAt   time.Time // shared lag gate: all workers pause until this instant
 	stopReason string
 }

@@ -74,6 +74,7 @@ const (
 	dataSourceOceanBase dataSourceType = "oceanbase"
 
 	queryVersionSQL   = "select version()"
+	dbNowLiteralSQL   = "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')"
 	obCompatModeOnSQL = "SET SESSION _show_ddl_in_compat_mode = true"
 	obShowIndexSQL    = "show index from %s"
 )
@@ -347,13 +348,28 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return fmt.Errorf("please confirm sql type is update or delete")
 	}
 
+	// Metadata and DB-session-derived literals are read through one connection so
+	// session state (timezone, OB compatibility mode) stays coherent.
+	ctx := context.Background()
+	conn, dataSource, err := w.openMetadataConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	w.dataSource = dataSource
+
 	if v.whereClause != "" {
 		whereClause := v.whereClause
 		// freeze NOW()-like functions so every chunk uses the same timestamp
-		frozenWhere, freezeErr := FreezeNow(whereNode, time.Now())
-		if freezeErr != nil {
-			log.Logger.Warnf("freeze NOW() failed, using original where: %v", freezeErr)
-		} else if frozenWhere != "" {
+		if HasFreezeNowFunc(whereNode) {
+			dbNowLiteral, nowErr := w.fetchDBNowLiteral(ctx, conn)
+			if nowErr != nil {
+				return nowErr
+			}
+			frozenWhere, freezeErr := FreezeNowLiteral(whereNode, dbNowLiteral)
+			if freezeErr != nil {
+				return fmt.Errorf("freeze NOW() failed: %w", freezeErr)
+			}
 			whereClause = frozenWhere
 		}
 
@@ -372,13 +388,6 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
 	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
-	ctx := context.Background()
-	conn, dataSource, err := w.openMetadataConn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	w.dataSource = dataSource
 
 	if c.TiDBRowID {
 		// _tidb_rowid 模式不依赖 PK/UK, 跳过唯一键解析;
@@ -490,6 +499,18 @@ func (w *Writer) openMetadataConn(
 	dataSource := detectDataSourceFromVersion(version)
 	log.Logger.Debugf("detected data source: [%s], version: [%s]", dataSource, version)
 	return conn, dataSource, nil
+}
+
+func (w *Writer) fetchDBNowLiteral(ctx context.Context, conn *sql.Conn) (string, error) {
+	var literal string
+	if err := conn.QueryRowContext(ctx, dbNowLiteralSQL).Scan(&literal); err != nil {
+		return "", fmt.Errorf("query database current time failed: %w", err)
+	}
+	literal = strings.TrimSpace(literal)
+	if literal == "" {
+		return "", fmt.Errorf("query database current time returned empty literal")
+	}
+	return literal, nil
 }
 
 func (w *Writer) enableOceanBaseDDLCompatMode(

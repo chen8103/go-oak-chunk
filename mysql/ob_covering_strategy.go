@@ -133,8 +133,17 @@ func (ocs *OBCoveringStrategy) Run(ctx context.Context, params RunParams) error 
 	// the producer's terminal status, so no page is dropped on completion.
 	for batch := range candidatesChan {
 		// Drain the rate-limit signal channel the same way Writer.Write does.
-		if ocs.applyRateLimit(runCtx, params) {
-			// fall through: still process this batch after the lag pause.
+		// A lag pause must not execute this batch until the loop has re-checked
+		// the latest signal; keep the batch in hand and retry the throttle step.
+		for ocs.applyRateLimit(runCtx, params) {
+			select {
+			case <-runCtx.Done():
+				cancel()
+				producerDone.Wait()
+				ocs.finish()
+				return nil
+			default:
+			}
 		}
 
 		select {

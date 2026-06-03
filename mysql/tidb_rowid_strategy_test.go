@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 func newRowIDStrategyForTest() *TiDBRowIDStrategy {
@@ -240,6 +242,58 @@ func bucketNumZero() <-chan int64 {
 	ch := make(chan int64, 1)
 	ch <- 0
 	return ch
+}
+
+func rowIDDeletes(state *rowidFakeDriverState) int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.deleteCalls
+}
+
+func TestTiDBRowID_Run_LagSignalRecheckedBeforeDelete(t *testing.T) {
+	state := &rowidFakeDriverState{
+		pkType:      "NONCLUSTERED",
+		selectPages: [][]int64{{1, 2}},
+	}
+	s := newRunnableRowIDStrategy(t, state, 3, 0)
+
+	bucket := newGateBucket()
+	bucketNum := make(chan int64, 2)
+	bucketNum <- vars.LagThreshold
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.Run(context.Background(), RunParams{Bucket: bucket, BucketNum: bucketNum})
+	}()
+
+	if got := bucket.waitForWait(t); got != 1000 {
+		t.Fatalf("first lag wait = %d, want 1000", got)
+	}
+	if got := rowIDDeletes(state); got != 0 {
+		t.Fatalf("delete calls during first lag wait = %d, want 0", got)
+	}
+
+	bucketNum <- vars.LagThreshold
+	bucket.release()
+	if got := bucket.waitForWait(t); got != 1000 {
+		t.Fatalf("second lag wait = %d, want 1000", got)
+	}
+	if got := rowIDDeletes(state); got != 0 {
+		t.Fatalf("delete calls before lag recheck completed = %d, want 0", got)
+	}
+
+	bucket.release()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned err: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run timed out")
+	}
+	if got := rowIDDeletes(state); got != 1 {
+		t.Fatalf("delete calls after lag clears = %d, want 1", got)
+	}
 }
 
 func TestTiDBRowID_Run_PagesAndStop(t *testing.T) {

@@ -62,6 +62,39 @@ func TestPreCheck_FastPathDeleteOK(t *testing.T) {
 	}
 }
 
+func TestPreCheck_FastPathRequiresPositiveChunkSize(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "covering",
+			mutate: func(c *Config) {
+				c.SelectOrderBy = "created_at"
+				c.ChunkSize = 0
+			},
+		},
+		{
+			name: "partition",
+			mutate: func(c *Config) {
+				c.SelectOrderBy = "created_at"
+				c.PartitionConcurrency = 4
+				c.ChunkSize = 0
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := baseConfig()
+			tt.mutate(c)
+			err := c.PreCheck()
+			if err == nil || !strings.Contains(err.Error(), "--chunk-size > 0") {
+				t.Fatalf("expected positive chunk-size error, got: %v", err)
+			}
+		})
+	}
+}
+
 func TestPreCheck_SelectCursorRequiresOrderBy(t *testing.T) {
 	c := baseConfig()
 	c.SelectCursor = true

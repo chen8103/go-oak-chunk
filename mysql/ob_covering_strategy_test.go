@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/juju/ratelimit"
+
+	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
 
 func newCoveringStrategyForTest(pkCols, orderCols []string, cursor bool, cursorVals []any) *OBCoveringStrategy {
@@ -315,6 +317,38 @@ type noopBucket struct{}
 
 func (noopBucket) Wait(int64) {}
 
+type gateBucket struct {
+	waits    chan int64
+	releases chan struct{}
+}
+
+func newGateBucket() *gateBucket {
+	return &gateBucket{
+		waits:    make(chan int64, 8),
+		releases: make(chan struct{}, 8),
+	}
+}
+
+func (b *gateBucket) Wait(n int64) {
+	b.waits <- n
+	<-b.releases
+}
+
+func (b *gateBucket) release() {
+	b.releases <- struct{}{}
+}
+
+func (b *gateBucket) waitForWait(t *testing.T) int64 {
+	t.Helper()
+	select {
+	case n := <-b.waits:
+		return n
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for Bucket.Wait")
+		return 0
+	}
+}
+
 // countingBucket records every token count passed to Wait so a test can assert
 // the strategy never throttles by row count when sleep/rows-per-sec are off.
 type countingBucket struct {
@@ -330,6 +364,68 @@ func (b *countingBucket) Wait(n int64) {
 		b.maxOnce = n
 	}
 	b.mu.Unlock()
+}
+
+func coveringDeletes(state *coveringFakeDriverState) int {
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	return state.deleteCalls
+}
+
+func TestOBCoveringStrategy_Run_LagSignalRecheckedBeforeDelete(t *testing.T) {
+	pages := [][][]driver.Value{
+		{{[]byte("2025-01-01"), []byte("1")}},
+	}
+	db, state := newCoveringTestDB(t, pages)
+	ocs := &OBCoveringStrategy{
+		writer: &Writer{
+			MysqlClient:       db,
+			Database:          "d",
+			Table:             "t",
+			OriginWhereClause: "(id > 0)",
+			ChunkSize:         2,
+			unqKeys:           &UnqKeys{UniqueKeyColumns: []string{"id"}},
+		},
+		selectOrderCols: []string{"created_at"},
+	}
+
+	bucket := newGateBucket()
+	bucketNum := make(chan int64, 2)
+	bucketNum <- vars.LagThreshold
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ocs.Run(context.Background(), RunParams{Bucket: bucket, BucketNum: bucketNum})
+	}()
+
+	if got := bucket.waitForWait(t); got != 1000 {
+		t.Fatalf("first lag wait = %d, want 1000", got)
+	}
+	if got := coveringDeletes(state); got != 0 {
+		t.Fatalf("delete calls during first lag wait = %d, want 0", got)
+	}
+
+	bucketNum <- vars.LagThreshold
+	bucket.release()
+	if got := bucket.waitForWait(t); got != 1000 {
+		t.Fatalf("second lag wait = %d, want 1000", got)
+	}
+	if got := coveringDeletes(state); got != 0 {
+		t.Fatalf("delete calls before lag recheck completed = %d, want 0", got)
+	}
+
+	bucket.release()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned err: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run timed out")
+	}
+	if got := coveringDeletes(state); got != 1 {
+		t.Fatalf("delete calls after lag clears = %d, want 1", got)
+	}
 }
 
 func TestOBCoveringStrategy_Run_NoRowCountThrottle(t *testing.T) {

@@ -473,6 +473,8 @@ type getInfoCall struct {
 type getInfoPlan struct {
 	version        string
 	versionErr     error
+	dbNowLiteral   string
+	dbNowErr       error
 	setSessionErr  error
 	createTableDDL string
 	showCreateErr  error
@@ -556,6 +558,21 @@ func (c *getInfoFakeConn) QueryContext(
 			columns: []string{"version()"},
 			rows: [][]driver.Value{
 				{[]byte(version)},
+			},
+		}, nil
+	case strings.Contains(lowerQuery, "date_format(now()"):
+		plan := c.recordCall("db_now")
+		if plan.dbNowErr != nil {
+			return nil, plan.dbNowErr
+		}
+		literal := plan.dbNowLiteral
+		if literal == "" {
+			literal = "2026-06-03 12:00:00"
+		}
+		return &getInfoFakeRows{
+			columns: []string{"DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')"},
+			rows: [][]driver.Value{
+				{[]byte(literal)},
 			},
 		}, nil
 	case strings.Contains(lowerQuery, "show create table"):
@@ -753,6 +770,29 @@ func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
 	}
 }
 
+func TestWriterGetInfoFromTable_FreezeNowUsesDatabaseTime(t *testing.T) {
+	db, state := newGetInfoTestDB(t, getInfoPlan{
+		version:      "8.0.36",
+		dbNowLiteral: "2026-06-03 18:19:20",
+	})
+	w := newWriterGetInfoForTest(db)
+	w.ExecuteSQL = "DELETE FROM `t1` WHERE `create_time` <= date_sub(now(), interval 15 day)"
+
+	err := w.getInfoFromTable(&conf.Config{
+		ExecuteQuery: w.ExecuteSQL,
+	})
+	if err != nil {
+		t.Fatalf("getInfoFromTable returned err: %v", err)
+	}
+	if !strings.Contains(w.OriginWhereClause, "2026-06-03 18:19:20") {
+		t.Fatalf("OriginWhereClause should contain DB current time literal, got: %s", w.OriginWhereClause)
+	}
+	if strings.Contains(strings.ToLower(w.OriginWhereClause), "now(") {
+		t.Fatalf("OriginWhereClause should not keep NOW(), got: %s", w.OriginWhereClause)
+	}
+	assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "db_now", "show_create"})
+}
+
 func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
 	t.Run("version_query_failed", func(t *testing.T) {
 		db, state := newGetInfoTestDB(t, getInfoPlan{
@@ -766,6 +806,22 @@ func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
 			t.Fatalf("expected query version failed error, got: %v", err)
 		}
 		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version"})
+	})
+
+	t.Run("db_now_query_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:  "8.0.36",
+			dbNowErr: errors.New("db now failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		w.ExecuteSQL = "DELETE FROM `t1` WHERE `create_time` <= now()"
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "query database current time failed") {
+			t.Fatalf("expected query database current time failed error, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "db_now"})
 	})
 
 	t.Run("oceanbase_set_session_failed", func(t *testing.T) {

@@ -110,8 +110,17 @@ func (s *TiDBRowIDStrategy) Run(ctx context.Context, params RunParams) error {
 	}()
 
 	for batch := range batchChan {
-		if s.applyRateLimit(runCtx, params) {
-			// fall through: still process this batch after the lag pause.
+		// A lag pause must not execute this batch until the loop has re-checked
+		// the latest throttle signal; keep the batch in hand and retry.
+		for s.applyRateLimit(runCtx, params) {
+			select {
+			case <-runCtx.Done():
+				cancel()
+				producerDone.Wait()
+				s.finish()
+				return nil
+			default:
+			}
 		}
 
 		select {

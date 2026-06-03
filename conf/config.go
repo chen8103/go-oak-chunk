@@ -137,6 +137,9 @@ func (c *Config) PreCheck() error {
 				sqlType,
 			)
 		}
+		if c.ChunkSize <= 0 {
+			return fmt.Errorf("--select-order-by covering fast-path requires --chunk-size > 0")
+		}
 	}
 	if c.SelectCursor && !fastPath {
 		return fmt.Errorf("--select-cursor requires --select-order-by")

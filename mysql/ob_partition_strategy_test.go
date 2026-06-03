@@ -179,6 +179,38 @@ func TestPartitionRunState_SetStopOnce(t *testing.T) {
 	}
 }
 
+func TestOBPartitionStrategy_ApplyPartitionRateLimitRetriesAfterLag(t *testing.T) {
+	orig := lagPauseDuration
+	lagPauseDuration = 20 * time.Millisecond
+	t.Cleanup(func() { lagPauseDuration = orig })
+
+	ps := &OBPartitionStrategy{}
+	state := &partitionRunState{}
+	bucketNum := make(chan int64, 1)
+	bucketNum <- vars.LagThreshold
+	if retry := ps.applyPartitionRateLimit(context.Background(), RunParams{
+		Bucket:    noopBucket{},
+		BucketNum: bucketNum,
+	}, state); !retry {
+		t.Fatal("lag signal should ask worker to retry loop before SELECT/DELETE")
+	}
+
+	state.signalLag(20 * time.Millisecond)
+	if retry := ps.applyPartitionRateLimit(context.Background(), RunParams{
+		Bucket:    noopBucket{},
+		BucketNum: make(chan int64, 1),
+	}, state); !retry {
+		t.Fatal("shared lag gate should ask worker to retry loop before SELECT/DELETE")
+	}
+
+	if retry := ps.applyPartitionRateLimit(context.Background(), RunParams{
+		Bucket:    noopBucket{},
+		BucketNum: make(chan int64, 1),
+	}, state); retry {
+		t.Fatal("no lag signal and no active gate should continue current worker loop")
+	}
+}
+
 // ---- fake driver covering discovery + partition-scoped SELECT/DELETE ----
 
 type partFakeState struct {

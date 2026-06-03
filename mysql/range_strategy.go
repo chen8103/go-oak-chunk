@@ -65,13 +65,19 @@ func (rs *RangeStrategy) Run(ctx context.Context, params RunParams) error {
 			}
 		case err := <-writeErr:
 			writeErr = nil
+			cancel()
+			var producerErr error
+			if produceErr != nil {
+				producerErr = <-produceErr
+				produceErr = nil
+			}
 			if err != nil {
-				cancel()
-				if produceErr != nil {
-					<-produceErr
-				}
 				return err
 			}
+			if producerErr != nil {
+				return producerErr
+			}
+			return nil
 		}
 	}
 	return nil

@@ -31,6 +31,12 @@ func TestFreezeNow_BasicFunctions(t *testing.T) {
 			notWant: "current_timestamp",
 		},
 		{
+			name:    "current_timestamp_without_parentheses",
+			sql:     "DELETE FROM orders WHERE ts < current_timestamp",
+			want:    []string{frozen},
+			notWant: "current_timestamp",
+		},
+		{
 			name:    "sysdate()",
 			sql:     "DELETE FROM logs WHERE create_time <= sysdate()",
 			want:    []string{frozen},
