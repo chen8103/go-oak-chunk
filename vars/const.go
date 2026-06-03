@@ -26,6 +26,20 @@ const (
             AND TABLE_NAME = ?
             AND PARTITION_NAME IS NOT NULL
         ORDER BY PARTITION_ORDINAL_POSITION`
+
+	// TiDBPKTypeSQL reports whether a TiDB table is CLUSTERED or NONCLUSTERED.
+	// Only NONCLUSTERED tables expose the hidden `_tidb_rowid` handle used by
+	// TiDBRowIDStrategy.
+	TiDBPKTypeSQL = `
+        SELECT TIDB_PK_TYPE
+        FROM information_schema.tables
+        WHERE TABLE_SCHEMA = ?
+            AND TABLE_NAME = ?`
+
+	// TiDBRowIDProbeSQL probes whether `_tidb_rowid` is selectable, used as a
+	// fallback on TiDB versions that lack the TIDB_PK_TYPE column. Takes the
+	// quoted `db`.`table` reference.
+	TiDBRowIDProbeSQL = "SELECT _tidb_rowid FROM %s LIMIT 1"
 )
 
 const (

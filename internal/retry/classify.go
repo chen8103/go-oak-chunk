@@ -33,6 +33,9 @@ var transientMySQLErrno = map[uint16]struct{}{
 	4012: {}, // OB: transaction conflict (rollback and retry)
 	2006: {}, // MySQL server has gone away
 	2013: {}, // lost connection to MySQL server during query
+	9007: {}, // TiDB: write conflict (safe to retry)
+	8022: {}, // TiDB: transaction commit failed, safe to retry
+	8028: {}, // TiDB: information schema changed during transaction
 }
 
 // Classify examines err and returns its retry class.

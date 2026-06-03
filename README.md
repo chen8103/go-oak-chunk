@@ -62,6 +62,11 @@ B. 当从库检测协程运行异常时
 - `--partition-concurrency` 在上述 fast-path 基础上，按表分区并发删除（**仅 OceanBase、需分区表**）。每个 worker 独占一个分区、各自维护游标，并通过 `PARTITION(...)` 限定范围；`<=1` 时回退为单 worker。
   限流器（令牌桶 + `--rows-per-sec`）在所有 worker 间共享，因此限制的是**全局**速率；从库延迟暂停会让所有 worker 一起暂停。
 
+### 6. TiDB `_tidb_rowid` 清理（`--tidb-rowid`）
+- TiDB 专属：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主键/唯一键**的 TiDB **NONCLUSTERED（非聚簇）** 表也能分批 DELETE（默认 RangeStrategy 找不到 PK/UK 会直接报错）。
+- 采用 seek 游标 + `_tidb_rowid IN (...)` 删除，对 `SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 稀疏 rowid 健壮；始终复用冻结后的 WHERE。**仅 DELETE**；显式开关，不改 TiDB 默认行为；与覆盖快路径/分区并发/`--force-chunking-column` 互斥。
+- 运行时校验适用性，CLUSTERED 表清晰报错。
+
 更详细的说明见 [`doc/design/cli-usage.md`](doc/design/cli-usage.md) 与 [`doc/design/sdk-usage.md`](doc/design/sdk-usage.md)。
 
 
@@ -112,6 +117,7 @@ Flags:
       --select-index string            FORCE INDEX name for the two-phase candidate SELECT (covering index strategy)
       --select-order-by string         Order columns for the two-phase candidate SELECT (comma-separated). Enables covering-index fast-path (DELETE only)
       --sleep int                      Number of milliseconds to sleep between chunks.
+      --tidb-rowid                     TiDB only: chunk DELETE by the hidden _tidb_rowid handle (NONCLUSTERED tables, no PK/UK required)
       --txn-size int                   Number of rows per transaction. (default 1000)
   -u, --user string                    MySQL user (default "root")
       --yes                            Skip the large-table confirmation prompt
@@ -145,6 +151,12 @@ $ ./goc run --chunk-size 1000 -d test \
 --host 127.0.0.1 --port 3306 --user root --password 'xxx' \
 --select-order-by created_at --select-cursor \
 --partition-concurrency 4
+
+# TiDB 无主键表按 _tidb_rowid 分块删除（DELETE only）
+$ ./goc run --tidb-rowid --chunk-size 1000 -d test \
+--execute "delete from rule_set_exe_history where create_time <= date_sub(now(), interval 15 day)" \
+--host 127.0.0.1 --port 4000 --user root --password 'xxx' \
+--print-progress
 ```
 
 ## 压测结果

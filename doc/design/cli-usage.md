@@ -101,6 +101,7 @@ go run ./cmd/go-oak-chunk run --help
 | `--max-rows` | int64 / `0` | 否 | 处理满指定行数后停止 | `0` 表示不限；对 range/covering/partition 三种策略均生效 |
 | `--max-duration-ms` | int64 / `0` | 否 | 运行满指定毫秒后停止 | `0` 表示不限；对三种策略均生效 |
 | `--partition-concurrency` | int / `0` | 否 | OceanBase 专属：分区并行 DELETE 的 worker 数 | `0/1` 关闭；需配合 `--select-order-by` 且表为分区表 |
+| `--tidb-rowid` | bool / `false` | 否 | TiDB 专属：按隐藏 `_tidb_rowid` 分块 DELETE | 仅 DELETE；NONCLUSTERED 表、无需 PK/UK；与覆盖快路径/分区并发/`--force-chunking-column` 互斥 |
 | `--dry-run` | bool / `false` | 否 | 只打印样例 SQL，不实际执行 | 用于预览快路径 SELECT/DELETE 形态 |
 | `--preflight-threshold` | int64 / `0` | 否 | EXPLAIN 预估大表确认阈值 | `0` 表示用默认值 `100000` |
 | `--yes` | bool / `false` | 否 | 跳过大表确认交互 | SDK/非交互场景建议开启 |
@@ -152,6 +153,7 @@ go run ./cmd/go-oak-chunk run --help
 | `max_rows` | `--max-rows` | 处理满行数后停止（`0`=不限） |
 | `max_duration_ms` | `--max-duration-ms` | 运行满毫秒后停止（`0`=不限） |
 | `partition_concurrency` | `--partition-concurrency` | OceanBase 分区并行 worker 数（`0/1`=关闭） |
+| `tidb_rowid` | `--tidb-rowid` | TiDB 按 `_tidb_rowid` 分块 DELETE（默认 `false`） |
 | `dry_run` | `--dry-run` | 只打印样例 SQL（默认 `false`） |
 | `preflight_threshold` | `--preflight-threshold` | 大表确认阈值（`0`=默认 `100000`） |
 | `auto_confirm` | `--yes` | 跳过大表确认（默认 `false`） |
@@ -416,6 +418,48 @@ go tool pprof -http=:8081 mem.pprof
 ```
 
 > 上例在 OceanBase 分区表 `orders` 上以 4 个 worker 并行删除，全表合计不超过 5 万行/秒，累计删满 200 万行即停止。
+
+---
+
+## 12ter. TiDB `_tidb_rowid` 清理（`--tidb-rowid`）
+
+TiDB 专属能力：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主键/唯一键**的 TiDB 表也能分批 DELETE（默认 `RangeStrategy` 需要可用的 PK/UK，否则直接报错无法运行）。
+
+### 12ter.1 生效条件
+
+- 显式加 `--tidb-rowid`（不改 TiDB 默认行为；默认 TiDB 仍走 `RangeStrategy`）
+- 仅 **DELETE**（`PreCheck` 拒绝 UPDATE）
+- 目标表必须是 TiDB **NONCLUSTERED（非聚簇）** 表 —— 只有这类表才有隐藏的 `_tidb_rowid`；运行时通过 `information_schema.tables.TIDB_PK_TYPE` 校验，**CLUSTERED 表会清晰报错**（老版本无该列时回退为 `SELECT _tidb_rowid ... LIMIT 1` 探测）
+- 与 `--select-order-by`/`--select-cursor`/`--select-index`/`--partition-concurrency>1`/`--force-chunking-column` **互斥**
+- 需要 `--chunk-size > 0`
+
+### 12ter.2 算法
+
+每个 chunk 两步，单 worker，游标只在 DELETE 提交后前移：
+
+1. `SELECT _tidb_rowid FROM \`db\`.\`t\` WHERE <冻结WHERE> [AND _tidb_rowid > ?] ORDER BY _tidb_rowid LIMIT <chunk-size>`
+2. `DELETE FROM \`db\`.\`t\` WHERE <冻结WHERE> AND _tidb_rowid IN (...)`
+
+采用 **seek 游标**（`_tidb_rowid > cursor`）而非 `MIN/MAX` 算术步进：`SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 会把 rowid 散布到 int64 高位，算术步进会产生海量空范围；seek 方式对间隙不敏感。DELETE 始终复用**冻结后的 WHERE**，IN 列表精确锁定生产者看到的句柄，绝不会触及谓词外或 SELECT/DELETE 间新插入的行。`--max-rows`/`--max-duration-ms` 护栏、`--rows-per-sec`/sleep/lag 限流、失败重试均复用既有机制（含 TiDB 写冲突码 9007/8022/8028 重试）。
+
+### 12ter.3 示例
+
+```bash
+./goc run \
+  --tidb-rowid \
+  -d test \
+  -e "DELETE FROM rule_set_exe_history WHERE create_time <= date_sub(now(), interval 15 day)" \
+  --chunk-size 1000 \
+  --rows-per-sec 50000 \
+  --no-slaves \
+  --print-progress \
+  -H 127.0.0.1 -P 4000 -u root -p 'xxx'
+```
+
+```bash
+# 先 dry-run 预览样例 SELECT/DELETE
+./goc run --tidb-rowid --dry-run -d test -e "DELETE FROM t WHERE create_time <= now()" --chunk-size 1000 ...
+```
 
 ---
 

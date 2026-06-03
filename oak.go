@@ -130,6 +130,20 @@ func WithPartitionConcurrency(n int) Option {
 	}
 }
 
+// WithTiDBRowID enables the TiDB `_tidb_rowid` chunked-DELETE strategy
+// (DELETE only). It chunks by the hidden _tidb_rowid handle, so the table needs
+// no PK/UK; it must be a NONCLUSTERED TiDB table (verified at runtime).
+// Mutually exclusive with the covering/partition fast-path; validated in
+// NewExecutor's config.PreCheck.
+func WithTiDBRowID(enabled bool) Option {
+	return func(e *Executor) {
+		if e.config == nil {
+			return
+		}
+		e.config.TiDBRowID = enabled
+	}
+}
+
 // WithDryRun enables dry-run mode (prints sample SQL, does not execute).
 func WithDryRun(enabled bool) Option {
 	return func(e *Executor) {

@@ -42,6 +42,11 @@ func TestSelectStrategy(t *testing.T) {
 			config:   &conf.Config{SelectOrderBy: "created_at", PartitionConcurrency: 1},
 			wantName: "OBCoveringStrategy",
 		},
+		{
+			name:     "tidb-rowid takes top priority",
+			config:   &conf.Config{TiDBRowID: true},
+			wantName: "TiDBRowIDStrategy",
+		},
 	}
 
 	for _, tt := range tests {

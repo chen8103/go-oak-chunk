@@ -68,6 +68,7 @@ import (
 | `oak.WithMaxRows(n)` | 处理满 `n` 行后停止 | `0`=不限；对三种策略均生效 |
 | `oak.WithMaxDuration(ms)` | 运行满 `ms` 毫秒后停止 | `0`=不限；对三种策略均生效 |
 | `oak.WithPartitionConcurrency(n)` | OceanBase 分区并行 DELETE | `0/1`=关闭；需覆盖快路径 + 分区表 |
+| `oak.WithTiDBRowID(true)` | TiDB 按 `_tidb_rowid` 分块 DELETE | 仅 DELETE；NONCLUSTERED 表、无需 PK/UK；与覆盖快路径/分区互斥 |
 
 常见错误：
 
@@ -163,6 +164,7 @@ func main() {
 | `MaxRows` | `int64` | `0` | 处理满行数后停止；`0`=不限，对三种策略均生效 |
 | `MaxDuration` | `int64` | `0` | 运行满毫秒后停止；`0`=不限，对三种策略均生效 |
 | `PartitionConcurrency` | `int` | `0` | OceanBase 分区并行 DELETE worker 数；`0/1`=关闭 |
+| `TiDBRowID` | `bool` | `false` | TiDB 按 `_tidb_rowid` 分块 DELETE（NONCLUSTERED 表、无需 PK/UK）；与覆盖快路径/分区/`ForceChunkingColumn` 互斥 |
 | `DryRun` | `bool` | `false` | 只打印样例 SQL，不实际执行 |
 | `PreflightThreshold` | `int64` | `0` | EXPLAIN 大表确认阈值；`0`=默认 `100000` |
 | `AutoConfirm` | `bool` | `false` | 跳过大表确认；SDK/非交互建议 `true` |
@@ -417,6 +419,23 @@ oak.NewExecutor(cfg,
 - 从库延迟暂停（`MaxLag` 命中）**全局**生效，所有 worker 一起暂停
 - `MaxRows` 在多 worker 间**精确**生效（合计不超过、零超删），`MaxRows=0` 仍为完全不限
 - 任一 worker 报错取消整个并发组，第一个错误向上返回
+
+---
+
+## 11quater. TiDB `_tidb_rowid` 清理（`WithTiDBRowID`）
+
+```go
+oak.NewExecutor(cfg,
+    oak.WithTiDBRowID(true), // 也可直接 cfg.TiDBRowID = true
+)
+```
+
+- 用 TiDB 隐藏行句柄 `_tidb_rowid` 做分块键，让**无主键/唯一键**的 TiDB **NONCLUSTERED（非聚簇）** 表也能分批 DELETE
+- **仅 DELETE**；显式开关，不改 TiDB 默认行为（默认仍走范围分块）
+- 与 `SelectOrderBy`/`SelectCursor`/`SelectIndex`/`PartitionConcurrency>1`/`ForceChunkingColumn` **互斥**（`PreCheck` 校验）；需要 `ChunkSize > 0`
+- 运行时通过 `information_schema.tables.TIDB_PK_TYPE` 校验适用性，CLUSTERED 表清晰报错（老版本回退为 `_tidb_rowid` 探测）
+- 采用 seek 游标（`_tidb_rowid > cursor`）+ `_tidb_rowid IN (...)` 删除，对 `SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 稀疏 rowid 健壮；游标只在 DELETE 提交后前移，始终复用冻结后的 WHERE
+- `MaxRows`/`MaxDuration` 护栏、`RowsPerSec`/sleep/lag 限流、失败重试（含 TiDB 写冲突码）均复用既有机制
 
 ---
 
