@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	"github.com/gdamore/tcell"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/internal/preflight"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/mysql"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/task/lag_checker"
@@ -88,6 +91,8 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 		rateLimiter = NewRateLimiterFromConfig(config)
 	}
 
+	rowsLimiter := NewRowsLimiterFromConfig(config)
+
 	progressInterval := opts.ProgressInterval
 	if progressInterval <= 0 {
 		progressInterval = 3 * time.Second
@@ -117,19 +122,27 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 		log.Logger.Debug("getStopTime goroutine is finished")
 	}()
 
-	readErrChan := make(chan error, 1)
-	p := mysql.NewProcedure(runCtx, writer)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		readErrChan <- p.BuildSQL(writer.ProducerQueue)
-	}()
+	// Preflight runs before the first chunk. Skipped under dry-run (no DB work).
+	if !config.DryRun {
+		if err := runPreflight(runCtx, config, writer); err != nil {
+			deferCancelOnce.Do(cancel)
+			cleanup()
+			return err
+		}
+	}
 
-	writeErrChan := make(chan error, 1)
+	strategy := selectStrategy(config, writer)
+	log.Logger.Infof("selected strategy: %s", strategy.Name())
+
+	executeErrChan := make(chan error, 1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		writeErrChan <- writer.Write(runCtx, rateLimiter.Bucket(), bucketNum)
+		executeErrChan <- strategy.Run(runCtx, mysql.RunParams{
+			Bucket:      rateLimiter.Bucket(),
+			BucketNum:   bucketNum,
+			RowsLimiter: rowsLimiter,
+		})
 	}()
 
 	tasksDoneChan := make(chan struct{}, 1)
@@ -167,24 +180,15 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 				return ErrExecutionStopped
 			}
 			return ctx.Err()
-		case readErr := <-readErrChan:
-			if readErr != nil {
-				readErr = normalizeStopError(readErr)
+		case execErr := <-executeErrChan:
+			if execErr != nil {
+				execErr = normalizeStopError(execErr)
 				deferCancelOnce.Do(cancel)
 				cleanup()
 				waitProgressDone()
-				return readErr
+				return execErr
 			}
-			readErrChan = nil
-		case writeErr := <-writeErrChan:
-			if writeErr != nil {
-				writeErr = normalizeStopError(writeErr)
-				deferCancelOnce.Do(cancel)
-				cleanup()
-				waitProgressDone()
-				return writeErr
-			}
-			writeErrChan = nil
+			executeErrChan = nil
 		case <-tasksDoneChan:
 			deferCancelOnce.Do(cancel)
 			cleanup()
@@ -192,6 +196,91 @@ func Execute(ctx context.Context, config *conf.Config, writer *mysql.Writer, opt
 			return nil
 		}
 	}
+}
+
+// selectStrategy 根据配置和 writer 元信息选择执行策略。
+//
+// 决策树(优先级从高到低):
+//  1. config.TiDBRowID -> TiDB _tidb_rowid 分块 DELETE(NONCLUSTERED 表, 无需 PK/UK)。
+//     适用性(数据源/聚簇性) 由 TiDBRowIDStrategy.Run 在运行时校验。
+//  2. config.PartitionConcurrency>1 + OceanBase + 覆盖快路径 -> OB 分区并行 DELETE。
+//  3. config.SelectOrderBy 非空 -> 覆盖索引两阶段 fast-path(DELETE only)。
+//     SqlType 与依赖关系已在 config.PreCheck 校验。
+//  4. 否则 -> 默认范围分块 RangeStrategy(行为零变化)。
+func selectStrategy(config *conf.Config, writer *mysql.Writer) mysql.ChunkStrategy {
+	// P4: TiDB _tidb_rowid chunked DELETE. Explicit opt-in via --tidb-rowid;
+	// the DataSource==tidb / NONCLUSTERED checks need a DB connection and run in
+	// TiDBRowIDStrategy.Run, keeping selectStrategy connection-free.
+	if config.TiDBRowID {
+		return mysql.NewTiDBRowIDStrategy(writer, &mysql.TiDBRowIDOptions{
+			DryRun:      config.DryRun,
+			MaxRows:     config.MaxRows,
+			MaxDuration: time.Duration(config.MaxDuration) * time.Millisecond,
+		})
+	}
+
+	// P3: OceanBase partition-parallel covering DELETE. Requires the covering
+	// fast-path (validated in PreCheck) and an OceanBase data source. Whether the
+	// table is actually partitioned is verified at runtime by discoverPartitions.
+	if config.PartitionConcurrency > 1 &&
+		writer.DataSource() == "oceanbase" &&
+		strings.TrimSpace(config.SelectOrderBy) != "" {
+		return mysql.NewOBPartitionStrategy(writer, &mysql.OBPartitionOptions{
+			SelectIndex:   config.SelectIndex,
+			SelectOrderBy: config.SelectOrderBy,
+			SelectCursor:  config.SelectCursor,
+			DryRun:        config.DryRun,
+			MaxRows:       config.MaxRows,
+			MaxDuration:   time.Duration(config.MaxDuration) * time.Millisecond,
+			Concurrency:   config.PartitionConcurrency,
+		})
+	}
+	if strings.TrimSpace(config.SelectOrderBy) != "" {
+		return mysql.NewOBCoveringStrategy(writer, &mysql.OBCoveringOptions{
+			SelectIndex:   config.SelectIndex,
+			SelectOrderBy: config.SelectOrderBy,
+			SelectCursor:  config.SelectCursor,
+			DryRun:        config.DryRun,
+			MaxRows:       config.MaxRows,
+			MaxDuration:   time.Duration(config.MaxDuration) * time.Millisecond,
+		})
+	}
+	return mysql.NewRangeStrategy(writer)
+}
+
+// runPreflight estimates the affected row count via EXPLAIN before launching the
+// strategy. EXPLAIN failures are non-fatal (logged, then continue). When the
+// estimate reaches the threshold and confirmation is not auto-granted, it reads
+// an interactive yes/no on stdin (CLI); SDK callers pass AutoConfirm.
+func runPreflight(ctx context.Context, config *conf.Config, writer *mysql.Writer) error {
+	threshold := config.PreflightThreshold
+	if threshold <= 0 {
+		threshold = preflight.DefaultLargeTableThreshold
+	}
+
+	table := fmt.Sprintf("`%s`.`%s`", writer.Database, writer.Table)
+	estimated, err := preflight.EstimateRows(ctx, writer.MysqlClient, table, writer.OriginWhereClause)
+	if err != nil {
+		log.Logger.Warnf("preflight EXPLAIN failed (continuing): %v", err)
+		return nil
+	}
+
+	result := preflight.Result{EstimatedRows: estimated, Threshold: threshold}
+	log.Logger.Infof("preflight: estimated_rows=%d threshold=%d", result.EstimatedRows, result.Threshold)
+
+	if preflight.NeedsConfirmation(result, config.AutoConfirm) {
+		ok, confErr := preflight.ConfirmLargeDelete(os.Stdin, os.Stderr, result)
+		if confErr != nil {
+			return confErr
+		}
+		if !ok {
+			return fmt.Errorf(
+				"large delete confirmation rejected (estimated_rows=%d >= threshold=%d)",
+				result.EstimatedRows, result.Threshold,
+			)
+		}
+	}
+	return nil
 }
 
 func getStopTime(ctx context.Context, sl *lag_checker.SlaveChecker, bucketNum chan int64, rateLimiter *RateLimiter, writer *mysql.Writer) {

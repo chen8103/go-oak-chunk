@@ -1,3 +1,34 @@
+### v3.3.0(20260603)
+#### feature:
+1. 新增 TiDB 专属清理策略 `--tidb-rowid`（SDK `WithTiDBRowID`）：按 TiDB 隐藏行句柄 `_tidb_rowid` 分块 DELETE，让**无主键/唯一键**的 TiDB 非聚簇（NONCLUSTERED）表也能高效分批清理（`mysql/tidb_rowid_strategy.go`）
+   - 采用 seek 游标（`WHERE _tidb_rowid > cursor ORDER BY _tidb_rowid LIMIT n`）+ `_tidb_rowid IN (...)` 删除，对 `SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 造成的稀疏 rowid 健壮；游标只在 DELETE 提交后前移，始终复用冻结后的 WHERE
+   - 运行时通过 `information_schema.tables.TIDB_PK_TYPE` 校验适用性，CLUSTERED 表清晰报错（老版本回退到 `_tidb_rowid` 探测）
+   - 仅 DELETE；显式开关，不改 TiDB 默认行为（默认仍走 RangeStrategy）；与覆盖快路径/分区并发/`--force-chunking-column` 互斥
+   - 复用既有 NOW() 冻结、`--max-rows`/`--max-duration-ms` 护栏、`--rows-per-sec`/sleep/lag 限流、重试机制
+2. `internal/retry` 错误分类补充 TiDB 写冲突可重试码：`9007`（write conflict）、`8022`（commit 可安全重试）、`8028`（info schema changed）
+
+### v3.2.0(20260602)
+#### feature:
+1. NOW() 冻结：执行前将 SQL 中的 `NOW()`/`CURRENT_TIMESTAMP` 等时间函数固化为单一时刻，保证长任务跨 chunk 的时间边界一致；冻结时间来自 DB session，查询数据库当前时间或还原冻结 literal 失败时会直接终止任务，不再降级使用原始 WHERE（`mysql/freeze.go`）
+2. OceanBase 错误分类 + 指数退避重试：区分可重试/不可重试错误，仅在事务尚未产生行变更时安全重试（`internal/retry`）
+3. 解析器升级：由 soar+pingcap 迁移到 `tidb/parser`，并抽出 `ChunkStrategy` 策略接口，为多策略/并发预留扩展点
+4. 覆盖索引两阶段快路径（仅 DELETE）：先按覆盖索引 SELECT 候选主键、再按主键 `IN` 删除，避免回表；新增 `--select-order-by`/`--select-index`/`--select-cursor`（`OBCoveringStrategy`）
+5. EXPLAIN 预检：执行前预估影响行数，大表触发确认；新增 `--preflight-threshold`/`--yes`（`internal/preflight`）
+6. dry-run：`--dry-run` 只打印样例 SELECT/DELETE，不实际执行
+7. 全局行速率限流：`--rows-per-sec` 在令牌桶（`--sleep`）与从库延迟（`--max-lag`）之外，叠加一个按行的全局速率上限（`0`=不限，`task/rows_limiter.go`）
+8. 执行上限统一生效：`--max-rows`/`--max-duration-ms` 现对 range/covering/partition 三种策略均生效，达到即干净停止（移除 P2 仅快路径可用的临时限制）
+9. OceanBase 分区并行 DELETE：`--partition-concurrency` 自动发现表分区并以 ≤N 个 worker 并行删除，每个 worker 独占分区与游标、按 `PARTITION(...)` 限定范围；限速器全局共享、从库延迟暂停对所有 worker 一起生效（`OBPartitionStrategy`）
+10. SDK 侧新增 `WithOBCovering`/`WithPreflight`/`WithDryRun`/`WithMaxRows`/`WithMaxDuration`/`WithRowsPerSec`/`WithPartitionConcurrency` 选项
+
+#### optimization:
+1. 分区路径 `--max-rows` 精确生效：提交前在锁内按剩余额度预留并裁剪批次，多 worker 合计不超过、零超删
+2. 分区名作为标识符注入 SELECT/DELETE 时做反引号转义（防御性硬化）
+3. 连接池上限随 `--partition-concurrency` 调整，始终保留 +2 连接余量（`max(10, 并发数+2)`），避免高并发抢连接
+4. 补全 CLI/SDK 文档参数表与默认值，新增 8 工人并发竞态（`-race`）测试
+
+#### bugFix:
+1. 修复覆盖索引/分区 DELETE 路径每个 chunk 后误用「睡眠令牌桶」做行级限流：原 `Bucket.Wait(affected)` 把删除行数当毫秒数等待（桶为 1 token=1ms），导致 `--sleep 0 --rows-per-sec 0` 时仍每 1000 行 chunk 隐式 sleep ~1 秒，多 worker 共享桶更将整表吞吐压到 ~1000 行/秒。现移除该调用，行级限流统一交给 `--rows-per-sec`（`0`=不限速、跑满速），新增回归测试断言 sleep=0 时不产生行数级等待
+
 ### v3.1.0(20260415)
 #### bugFix:
 1. 修复 OceanBase 场景下仅靠兼容 DDL 无法识别全局唯一键的问题；现在会额外通过 `SHOW INDEX` 发现主键/唯一键候选

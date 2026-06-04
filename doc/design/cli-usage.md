@@ -21,9 +21,13 @@
 
 - 只支持 `UPDATE` / `DELETE`（单条 SQL），按 chunk 分批执行
 - 利用主键/唯一键推进游标，避免全表扫描式批处理
-- 支持从库延迟感知，动态调节节奏
+- 多数据源专属加速（DELETE）：
+  - **OceanBase**：覆盖索引两阶段快路径（`--select-order-by`），可进一步**分区并行**（`--partition-concurrency`）
+  - **TiDB**：按隐藏行句柄 `_tidb_rowid` 分块（`--tidb-rowid`），支持**无主键/唯一键**的 NONCLUSTERED 表
+- 统一限流与守护边界：令牌桶（`--sleep`）+ 全局行速率（`--rows-per-sec`）+ 从库延迟感知（`--max-lag`），`--max-rows` / `--max-duration-ms` 跑够即停
+- 长任务 NOW() 时间冻结、失败错误分类重试（含 OB/TiDB 专属码）
 - 支持运行中进度输出
-- 支持 `SIGINT/SIGTERM` 优雅停止
+- 支持 `SIGINT/SIGTERM` 优雅停止、`--dry-run` 预览、EXPLAIN 大表预检
 - 支持 CPU / Memory profile 输出
 
 ---
@@ -94,6 +98,17 @@ go run ./cmd/go-oak-chunk run --help
 | `--no-slaves` | bool / `false` | 否 | 跳过从库延迟检测 | TiDB/OceanBase 场景常用 |
 | `--print-progress` | bool / `false` | 否 | 控制台打印进度 | 每 3 秒刷新 |
 | `--debug` | bool / `false` | 否 | 打开 debug 日志 | |
+| `--rows-per-sec` | int64 / `0` | 否 | 全局每秒行数上限 | `0` 表示不限速；与 `--sleep`/`--max-lag` 叠加生效 |
+| `--select-order-by` | string / 空 | 否 | 两阶段候选 SELECT 的排序列（逗号分隔） | 开启覆盖索引快路径（仅 DELETE）；`--partition-concurrency` 的前置条件 |
+| `--select-index` | string / 空 | 否 | 候选 SELECT 的 `FORCE INDEX` 名 | 需配合 `--select-order-by`；不填则交由优化器选择 |
+| `--select-cursor` | bool / `false` | 否 | 用游标推进候选 SELECT，避免每轮从头重扫 | 需配合 `--select-order-by`；大表强烈建议开启 |
+| `--max-rows` | int64 / `0` | 否 | 处理满指定行数后停止 | `0` 表示不限；对 range/covering/partition 三种策略均生效 |
+| `--max-duration-ms` | int64 / `0` | 否 | 运行满指定毫秒后停止 | `0` 表示不限；对三种策略均生效 |
+| `--partition-concurrency` | int / `0` | 否 | OceanBase 专属：分区并行 DELETE 的 worker 数 | `0/1` 关闭；需配合 `--select-order-by` 且表为分区表 |
+| `--tidb-rowid` | bool / `false` | 否 | TiDB 专属：按隐藏 `_tidb_rowid` 分块 DELETE | 仅 DELETE；NONCLUSTERED 表、无需 PK/UK；与覆盖快路径/分区并发/`--force-chunking-column` 互斥 |
+| `--dry-run` | bool / `false` | 否 | 只打印样例 SQL，不实际执行 | 用于预览快路径 SELECT/DELETE 形态 |
+| `--preflight-threshold` | int64 / `0` | 否 | EXPLAIN 预估大表确认阈值 | `0` 表示用默认值 `100000` |
+| `--yes` | bool / `false` | 否 | 跳过大表确认交互 | SDK/非交互场景建议开启 |
 
 ---
 
@@ -135,6 +150,17 @@ go run ./cmd/go-oak-chunk run --help
 | `no_slaves` | `--no-slaves` | 跳过从库检测 |
 | `txn_size` | `--txn-size` | 事务大小 |
 | `debug_mode` | `--debug` | debug 模式 |
+| `rows_per_sec` | `--rows-per-sec` | 全局每秒行数上限（`0`=不限） |
+| `select_order_by` | `--select-order-by` | 覆盖索引快路径排序列（默认空=关闭） |
+| `select_index` | `--select-index` | 候选 SELECT 的 FORCE INDEX 名（默认空） |
+| `select_cursor` | `--select-cursor` | 游标推进（默认 `false`；需配合 `select_order_by`） |
+| `max_rows` | `--max-rows` | 处理满行数后停止（`0`=不限） |
+| `max_duration_ms` | `--max-duration-ms` | 运行满毫秒后停止（`0`=不限） |
+| `partition_concurrency` | `--partition-concurrency` | OceanBase 分区并行 worker 数（`0/1`=关闭） |
+| `tidb_rowid` | `--tidb-rowid` | TiDB 按 `_tidb_rowid` 分块 DELETE（默认 `false`） |
+| `dry_run` | `--dry-run` | 只打印样例 SQL（默认 `false`） |
+| `preflight_threshold` | `--preflight-threshold` | 大表确认阈值（`0`=默认 `100000`） |
+| `auto_confirm` | `--yes` | 跳过大表确认（默认 `false`） |
 | `correct` | 无直接 flag（内部修正值） | 建议维持 `50` |
 | `no_log_bin` | 暂无 CLI 暴露 | 当前版本保留字段 |
 
@@ -203,12 +229,27 @@ flowchart TD
 
 ## 9. 限流与从库延迟控制机制
 
-内部使用 1ms 粒度令牌桶，核心受以下参数影响：
+### 9.0 工作原理（两套独立机制）
 
-- `sleep`（毫秒）
-- `max_lag`（秒）
-- `no_consider_lag`
-- `correct`（修正值）
+限流由**两套相互独立**的机制组成，都在「每个 chunk 提交后」生效，最终节奏取决于更严格的那个：
+
+**机制 A：sleep / 从库延迟节流（令牌桶）**——管「时间节奏 + 从库保护」，受 `sleep`、`max_lag`、`no_consider_lag`、`correct` 控制。
+
+- **令牌桶**：1ms 粒度（1 token = 1 毫秒，每秒产 1000 个），token 数即「要等待的毫秒数」。
+- **控制器 `getStopTime` 协程**循环计算应等待的 token 数，通过 `bucketNum` 通道喂给消费者：
+  1. 探测从库延迟 `lag`（`--no-slaves` 或无主从拓扑时跳过）；
+  2. 若 `lag >= max_lag`：推入哨兵值 `LagThreshold(-1)`，自身 sleep 800ms，通知消费者「暂停 ~1s 等从库追平」；
+  3. 否则按 `sleep`/`lag`/`no_consider_lag` 算出 token 数，叠加修正值 `correct`（默认 50，节流时增大、平时衰减，用于吸收机器 1~5ms 计时误差）后推出；
+  4. 自身 sleep「上一 chunk 耗时 × 5/4」（自适应轮询间隔）。
+- **消费者**（Writer / 覆盖 / 分区策略）每个 chunk 前非阻塞取 `bucketNum` 最新值：`-1` → 暂停 ~1s；`>0` → `Bucket.Wait(n)` 等 n 毫秒；`0`（`sleep=0` 且无 lag）→ 不等待。
+
+**机制 B：行速率节流（rows-per-sec）**——管「行吞吐上限」，独立于令牌桶（`task/rows_limiter.go`）。
+
+- 每个 chunk 删/改完后按本批实际行数等待 `affected / rows_per_sec` 秒；`0`=不限速；可被 ctx 取消（SIGINT 立即停）。
+
+**分区并发**下，令牌桶与 rows-per-sec limiter 均为**全局共享**，限制的是**全表合计**速率；从库延迟暂停会广播给所有 worker 一起暂停。
+
+> 取舍速查：要「批次节奏 / 保护从库」用 `--sleep` + `--max-lag`；要「封顶每秒行数」用 `--rows-per-sec`；全关即跑满速。
 
 ### 9.1 sleep 的真实行为
 
@@ -229,6 +270,36 @@ flowchart TD
 
 - `--no-slaves=true`：完全跳过从库延迟检测，只按 sleep/令牌桶节奏走
 - 适合无标准主从拓扑场景（如 TiDB/OceanBase）
+
+### 9.5 rows-per-sec（全局行速率上限）
+
+`--rows-per-sec` 在令牌桶（`sleep`）和从库延迟（`max-lag`）之外，再叠加一个**按行**的全局速率上限：
+
+- 含义是“每秒最多处理多少行”，每次执行 DML 前会按本批行数申请配额，配额不足则等待
+- 与 `--sleep`/`--max-lag` **叠加**生效：三者都会让 Writer 等待，最终节奏取决于最严格的那个
+- `--rows-per-sec=0`：不限速（默认）
+- 该限速器是 **全局共享** 的：在分区并行模式下，所有 worker 共用同一个限速器，限制的是**全表合计**的行速率，而不是每个 worker 各自的速率
+
+> 跑满速：`--sleep 0 --rows-per-sec 0`（且无 `--max-lag` 触发）时不会有任何隐式等待，覆盖索引/分区 DELETE 会以数据库能承受的速率执行。
+> （v3.2.0 之前的版本存在一个 bug：这两条路径每个 chunk 后会按删除行数误等待 ~1ms/行，导致即使关闭限速也被压到 ~1000 行/秒，已修复。）
+
+---
+
+## 9bis. 守护边界：max-rows / max-duration-ms
+
+`--max-rows` 与 `--max-duration-ms` 是“跑够就停”的护栏，二者任一触达即停止：
+
+- `--max-rows=N`：累计处理满 `N` 行后停止；`0` 表示不限
+- `--max-duration-ms=T`：运行满 `T` 毫秒后停止；`0` 表示不限
+
+> 说明：早期版本只允许在覆盖索引快路径（`--select-order-by`）上设置这两个参数，该限制已移除。
+> 现在 range（普通分块）、covering（覆盖索引快路径）、partition（分区并行）三种策略均会强制执行这两个边界。
+
+停止是**粗粒度**的，各路径的停止时机不同：
+
+- range 路径：在一个事务 / chunk 边界上检查并停止（用 `writer.GetRowAffects()` + 起始时间判断）
+- covering 路径：在一个 chunk 边界上停止
+- partition 路径：DELETE 前预留配额并把本批裁剪到剩余额度，`--max-rows` 在多 worker 间精确生效（合计不超过 `max-rows`，不会超删；详见 §12bis）
 
 ---
 
@@ -311,6 +382,88 @@ go tool pprof -http=:8081 mem.pprof
 
 > OceanBase 下会先通过兼容 DDL 获取列定义，再额外执行 `SHOW INDEX` 识别主键/唯一键。
 > 因此即使兼容 DDL 中缺失全局唯一键，`--force-chunking-column order_code` 这类指定也仍可命中真实唯一索引。
+
+---
+
+## 12bis. OceanBase 分区并行 DELETE（`--partition-concurrency`）
+
+这是 OceanBase 专属的加速能力：把覆盖索引两阶段 DELETE 快路径**按分区并行**执行。
+
+### 12bis.1 生效条件
+
+- 数据源必须是 **OceanBase**
+- 必须走覆盖索引快路径，即提供 `--select-order-by`（仅 DELETE）
+- 目标表必须是**分区表**（运行时通过 `information_schema.PARTITIONS` 探测）
+- `--partition-concurrency >= 2` 才会启用；`0/1` 退回单 worker 的 covering / range 路径
+
+### 12bis.2 并发行为
+
+- worker 数会被钳制到 `min(配置值, 实际分区数, 内部硬上限 64)`
+- 每个 worker 抢占一个分区名、独占自己的游标，DELETE 作用域限定在 ``\`db\`.\`table\` PARTITION (\`name\`)``
+- 连接池上限会随并发自动放大（约为 `并发数 + 2`），避免 worker 互相抢连接
+- 限速器（令牌桶 + `--rows-per-sec`）是**全局共享**的：限制的是全表合计速率，并发不会绕过限速
+- 从库延迟暂停（`--max-lag` 命中）是**全局**的：会让所有 worker 一起暂停等待从库追平
+- `--max-rows` 在多 worker 间精确生效：每个 worker DELETE 前在共享计数上预留 `min(本批行数, 剩余额度)` 并把本批裁剪到该额度，预留在锁内串行化，因此各 worker 已删前缀之和**永不超过** `max-rows`（零超删；若真实 DELETE 影响行数小于预留则可能略微少删，属安全方向）。`--max-rows=0` 仍为完全不限
+- 任一 worker 报错会取消整个并发组，第一个错误向上返回
+
+### 12bis.3 示例
+
+```bash
+./goc run \
+  -d test \
+  -e "DELETE FROM orders WHERE created_at < '2025-01-01 00:00:00'" \
+  --select-order-by "id" \
+  --partition-concurrency 4 \
+  --rows-per-sec 50000 \
+  --max-rows 2000000 \
+  --no-slaves \
+  --chunk-size 2000 \
+  -H 127.0.0.1 -P 2881 -u root@sys -p 'xxx'
+```
+
+> 上例在 OceanBase 分区表 `orders` 上以 4 个 worker 并行删除，全表合计不超过 5 万行/秒，累计删满 200 万行即停止。
+
+---
+
+## 12ter. TiDB `_tidb_rowid` 清理（`--tidb-rowid`）
+
+TiDB 专属能力：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主键/唯一键**的 TiDB 表也能分批 DELETE（默认 `RangeStrategy` 需要可用的 PK/UK，否则直接报错无法运行）。
+
+### 12ter.1 生效条件
+
+- 显式加 `--tidb-rowid`（不改 TiDB 默认行为；默认 TiDB 仍走 `RangeStrategy`）
+- 仅 **DELETE**（`PreCheck` 拒绝 UPDATE）
+- 目标表必须是 TiDB **NONCLUSTERED（非聚簇）** 表 —— 只有这类表才有隐藏的 `_tidb_rowid`；运行时通过 `information_schema.tables.TIDB_PK_TYPE` 校验，**CLUSTERED 表会清晰报错**（老版本无该列时回退为 `SELECT _tidb_rowid ... LIMIT 1` 探测）
+- 与 `--select-order-by`/`--select-cursor`/`--select-index`/`--partition-concurrency>1`/`--force-chunking-column` **互斥**
+- 需要 `--chunk-size > 0`
+
+### 12ter.2 算法
+
+每个 chunk 两步，单 worker，游标只在 DELETE 提交后前移：
+
+1. `SELECT _tidb_rowid FROM \`db\`.\`t\` WHERE <冻结WHERE> [AND _tidb_rowid > ?] ORDER BY _tidb_rowid LIMIT <chunk-size>`
+2. `DELETE FROM \`db\`.\`t\` WHERE <冻结WHERE> AND _tidb_rowid IN (...)`
+
+采用 **seek 游标**（`_tidb_rowid > cursor`）而非 `MIN/MAX` 算术步进：`SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 会把 rowid 散布到 int64 高位，算术步进会产生海量空范围；seek 方式对间隙不敏感。DELETE 始终复用**冻结后的 WHERE**，IN 列表精确锁定生产者看到的句柄，绝不会触及谓词外或 SELECT/DELETE 间新插入的行。`--max-rows`/`--max-duration-ms` 护栏、`--rows-per-sec`/sleep/lag 限流、失败重试均复用既有机制（含 TiDB 写冲突码 9007/8022/8028 重试）。
+
+### 12ter.3 示例
+
+```bash
+./goc run \
+  --tidb-rowid \
+  -d test \
+  -e "DELETE FROM rule_set_exe_history WHERE create_time <= date_sub(now(), interval 15 day)" \
+  --chunk-size 1000 \
+  --rows-per-sec 50000 \
+  --no-slaves \
+  --print-progress \
+  -H 127.0.0.1 -P 4000 -u root -p 'xxx'
+```
+
+```bash
+# 先 dry-run 预览样例 SELECT/DELETE
+./goc run --tidb-rowid --dry-run -d test -e "DELETE FROM t WHERE create_time <= now()" --chunk-size 1000 ...
+```
 
 ---
 

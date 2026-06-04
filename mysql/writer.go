@@ -3,7 +3,6 @@ package mysql
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -11,11 +10,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	soar "github.com/XiaoMi/soar/ast"
-	"github.com/juju/ratelimit"
-	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/tidb/parser"
+	"github.com/pingcap/tidb/parser/ast"
+	_ "github.com/pingcap/tidb/parser/test_driver"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
+	"github.com/SisyphusSQ/go-oak-chunk/v3/internal/retry"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/log"
 	"github.com/SisyphusSQ/go-oak-chunk/v3/vars"
 )
@@ -31,7 +31,14 @@ type Writer struct {
 	Table             string
 	noLogBing         bool
 	unqKeys           *UnqKeys
+	dataSource        dataSourceType
 	ProducerQueue     chan *Producer
+
+	// MaxRows 在累计影响行数达到该值后停止(0=不限)。停止发生在事务边界,
+	// 实际影响行数可能溢出 MaxRows 至多一个 txn-size, 与 OBCovering 的粗粒度语义一致。
+	MaxRows int64
+	// MaxDuration 在墙钟时长达到该值后停止(0=不限)。
+	MaxDuration time.Duration
 
 	isFinished    atomic.Bool
 	rowAffects    atomic.Int64
@@ -67,6 +74,7 @@ const (
 	dataSourceOceanBase dataSourceType = "oceanbase"
 
 	queryVersionSQL   = "select version()"
+	dbNowLiteralSQL   = "SELECT DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')"
 	obCompatModeOnSQL = "SET SESSION _show_ddl_in_compat_mode = true"
 	obShowIndexSQL    = "show index from %s"
 )
@@ -90,6 +98,8 @@ func NewWriter(c *conf.Config) (*Writer, error) {
 		TxnSize:       c.TxnSize,
 		ExecuteSQL:    strings.ReplaceAll(c.ExecuteQuery, ";", ""),
 		ProducerQueue: make(chan *Producer, 1000),
+		MaxRows:       c.MaxRows,
+		MaxDuration:   time.Duration(c.MaxDuration) * time.Millisecond,
 	}
 	w.SetCostTime(1 * time.Second)
 
@@ -136,9 +146,8 @@ func (w *Writer) preCheck(c *conf.Config) error {
 	return nil
 }
 
-func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum <-chan int64) error {
-	maxRetry := 3
-
+func (w *Writer) Write(ctx context.Context, bucket Bucket, bucketNum <-chan int64, rowsLimiter RowsLimiter) error {
+	runStart := time.Now()
 	for {
 		select {
 		case <-ctx.Done():
@@ -210,29 +219,44 @@ func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum 
 					return fmt.Errorf("execute sql failed after %d affected rows in current tx: %w", rowAffects, errEx)
 				}
 
-				var retryErr error
-				for i := 0; i < maxRetry; i++ {
-					tx, retryErr = w.MysqlClient.BeginTx(ctx, nil)
-					if retryErr != nil {
-						return retryErr
+				// 单 chunk 失败时，按错误分类做指数退避重试，每次重试都是独立事务。
+				var finalRes sql.Result
+				retryErr := retry.WithRetry(ctx, retry.DefaultPolicy(), func(attempt int) error {
+					if attempt > 1 {
+						log.Logger.Debugf("retry chunk execution (attempt %d)", attempt)
 					}
 
-					execCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-					res, retryErr = tx.ExecContext(execCtx, execSql, values...)
-					cancel()
-					if retryErr != nil {
-						_ = tx.Rollback()
-						if errors.Is(retryErr, context.Canceled) || errors.Is(retryErr, context.DeadlineExceeded) {
-							return retryErr
-						}
-						continue
+					retryTx, txErr := w.MysqlClient.BeginTx(ctx, nil)
+					if txErr != nil {
+						return txErr
 					}
-					break
-				}
+
+					r, execErr := retryTx.ExecContext(ctx, execSql, values...)
+					if execErr != nil {
+						_ = retryTx.Rollback()
+						return execErr
+					}
+
+					if commitErr := retryTx.Commit(); commitErr != nil {
+						_ = retryTx.Rollback()
+						return commitErr
+					}
+
+					finalRes = r
+					return nil
+				})
 
 				if retryErr != nil {
-					return fmt.Errorf("execute sql failed after %d retries: %w", maxRetry, retryErr)
+					return fmt.Errorf("execute chunk sql failed after retry: %w", retryErr)
 				}
+
+				// 重试已在独立事务里提交，外层事务已回滚，重开一个供后续 chunk 使用。
+				tx, err = w.MysqlClient.BeginTx(ctx, nil)
+				if err != nil {
+					return err
+				}
+
+				res = finalRes
 			}
 
 			// 算一下chunk-size和txn-size之间的关系
@@ -248,6 +272,28 @@ func (w *Writer) Write(ctx context.Context, bucket *ratelimit.Bucket, bucketNum 
 		}
 		w.AddRowAffects(rowAffects)
 		w.SetCostTime(time.Since(beginTime))
+
+		// 行级限流: 按本事务实际影响行数等待 rows/rowsPerSec 秒。
+		// ctx 取消时按既有的 clean-stop 语义返回 nil。
+		if rowsLimiter != nil {
+			if err = rowsLimiter.Wait(ctx, rowAffects); err != nil {
+				return nil
+			}
+		}
+
+		// 护栏: max-rows / max-duration 达到后干净停止(置 finish, 不报错),
+		// 与 OBCoveringStrategy.stopReached 语义一致。检查在事务提交后进行,
+		// 因此 max-rows 可能溢出至多一个 txn-size。
+		if w.MaxRows > 0 && w.GetRowAffects() >= w.MaxRows {
+			log.Logger.Infof("max-rows reached (%d), stopping", w.MaxRows)
+			w.SetFinished()
+			return nil
+		}
+		if w.MaxDuration > 0 && time.Since(runStart) >= w.MaxDuration {
+			log.Logger.Infof("max-duration reached (%s), stopping", w.MaxDuration)
+			w.SetFinished()
+			return nil
+		}
 
 		// finish flag
 		if shouldFinish || w.IsFinished() {
@@ -271,7 +317,7 @@ func (w *Writer) tableExists() (bool, error) {
 // fetch index
 func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	// First get sql type, update or delete?
-	sqlStmt, err := soar.TiParse(w.ExecuteSQL, "", "")
+	sqlStmt, _, err := parser.New().ParseSQL(w.ExecuteSQL)
 	if err != nil {
 		return err
 	}
@@ -282,15 +328,18 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	node := sqlStmt[0]
 	v := &visitor{}
-	switch node.(type) {
+	var whereNode ast.ExprNode
+	switch n := node.(type) {
 	case *ast.DeleteStmt:
 		w.SqlType = "Delete"
 		node.Accept(v)
+		whereNode = n.Where
 
 		w.ExecuteSQL = fmt.Sprintf("DELETE FROM `%s` WHERE ", w.Table)
 	case *ast.UpdateStmt:
 		w.SqlType = "Update"
 		node.Accept(v)
+		whereNode = n.Where
 
 		re := regexp.MustCompile(`set.*where|SET.*WHERE|set.*WHERE|SET.*where`)
 		sub := re.FindString(c.ExecuteQuery)
@@ -299,10 +348,34 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return fmt.Errorf("please confirm sql type is update or delete")
 	}
 
+	// Metadata and DB-session-derived literals are read through one connection so
+	// session state (timezone, OB compatibility mode) stays coherent.
+	ctx := context.Background()
+	conn, dataSource, err := w.openMetadataConn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	w.dataSource = dataSource
+
 	if v.whereClause != "" {
+		whereClause := v.whereClause
+		// freeze NOW()-like functions so every chunk uses the same timestamp
+		if HasFreezeNowFunc(whereNode) {
+			dbNowLiteral, nowErr := w.fetchDBNowLiteral(ctx, conn)
+			if nowErr != nil {
+				return nowErr
+			}
+			frozenWhere, freezeErr := FreezeNowLiteral(whereNode, dbNowLiteral)
+			if freezeErr != nil {
+				return fmt.Errorf("freeze NOW() failed: %w", freezeErr)
+			}
+			whereClause = frozenWhere
+		}
+
 		// avoid where clause "or", make program confused
-		w.OriginWhereClause = fmt.Sprintf("(%s)", v.whereClause)
-		log.Logger.Debugf("originWhereClause: [%s]", v.whereClause)
+		w.OriginWhereClause = fmt.Sprintf("(%s)", whereClause)
+		log.Logger.Debugf("originWhereClause: [%s]", whereClause)
 
 		w.ExecuteSQL += w.OriginWhereClause
 	}
@@ -315,12 +388,12 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
 	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
-	ctx := context.Background()
-	conn, dataSource, err := w.openMetadataConn(ctx)
-	if err != nil {
-		return err
+
+	if c.TiDBRowID {
+		// _tidb_rowid 模式不依赖 PK/UK, 跳过唯一键解析;
+		// 适用性(NONCLUSTERED) 由 TiDBRowIDStrategy.Run 在运行时校验。
+		return nil
 	}
-	defer conn.Close()
 
 	if dataSource == dataSourceOceanBase {
 		if err = w.enableOceanBaseDDLCompatMode(ctx, conn); err != nil {
@@ -333,7 +406,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		return err
 	}
 
-	tableStmt, err := soar.TiParse(tableMeta, "", "")
+	tableStmt, _, err := parser.New().ParseSQL(tableMeta)
 	if err != nil {
 		return err
 	}
@@ -426,6 +499,18 @@ func (w *Writer) openMetadataConn(
 	dataSource := detectDataSourceFromVersion(version)
 	log.Logger.Debugf("detected data source: [%s], version: [%s]", dataSource, version)
 	return conn, dataSource, nil
+}
+
+func (w *Writer) fetchDBNowLiteral(ctx context.Context, conn *sql.Conn) (string, error) {
+	var literal string
+	if err := conn.QueryRowContext(ctx, dbNowLiteralSQL).Scan(&literal); err != nil {
+		return "", fmt.Errorf("query database current time failed: %w", err)
+	}
+	literal = strings.TrimSpace(literal)
+	if literal == "" {
+		return "", fmt.Errorf("query database current time returned empty literal")
+	}
+	return literal, nil
 }
 
 func (w *Writer) enableOceanBaseDDLCompatMode(
@@ -547,7 +632,7 @@ func buildColumnMetas(tableNode *ast.CreateTableStmt) map[string]columnMeta {
 			}
 		}
 		columnMetas[strings.ToLower(col.Name.Name.String())] = columnMeta{
-			columnType: col.Tp.Tp,
+			columnType: col.Tp.GetType(),
 			isNull:     isNull,
 		}
 	}
@@ -695,6 +780,13 @@ func (w *Writer) unlockTable() error {
 		return fmt.Errorf("unlockTable failed: %w", err)
 	}
 	return nil
+}
+
+// DataSource 返回探测到的数据源类型("oceanbase"|"tidb"|"mysql")。
+// task 包用它判断是否走 OceanBase 分区并发策略, 返回 string 避免反向依赖
+// mysql 包的非导出类型 dataSourceType。元信息探测前为空串。
+func (w *Writer) DataSource() string {
+	return string(w.dataSource)
 }
 
 func (w *Writer) SetFinished() {

@@ -17,7 +17,7 @@
 ## 注意事项
 ### 1. 从库延迟检测
 该工具会主动自主库获取从库，然后尝试连接从库、检测从库的延迟。
-如果是云上集群，则会报个错，然后关闭从库延迟检测的功能继续进行chunk dml。（未对`tidb`做过测试，兼容性未知）
+如果是云上集群，则会报个错，然后关闭从库延迟检测的功能继续进行chunk dml。（此处指**从库延迟检测**对 `tidb` 拓扑未做充分测试；TiDB 的分 chunk DML 与 `--tidb-rowid` 清理能力是支持的，云上/无标准主从拓扑建议直接加 `--no-slaves`）
 
 
 ### 2. 关于`sleep`以及`notConsiderLag`参数的用法
@@ -48,6 +48,28 @@ B. 当从库检测协程运行异常时
 取(c.sleep-1, c.sleep]中的一个随机数
 
 
+### 3. 行数限流 `--rows-per-sec`
+在令牌桶（`sleep`/`max-lag`）之外，额外提供一个按"每秒处理行数"限流的开关。两者叠加生效：
+每个 chunk 提交后，按本次影响行数计算需要等待的时间。`0` 表示不限流。
+
+### 4. 执行上限 `--max-rows` / `--max-duration-ms`
+对所有策略（默认范围分块、覆盖索引 fast-path、分区并发）统一生效，达到行数或时间上限后**干净停止**（非报错）。
+各策略的停止粒度不同：范围分块在事务/chunk 边界停止；覆盖索引在 chunk 边界停止；分区并发会把最后一批裁剪到剩余额度，
+`--max-rows` 做到精确不超删。`0` 表示不限制。
+
+### 5. OceanBase 覆盖索引 fast-path 与分区并发
+- `--select-order-by`（可配合 `--select-index` / `--select-cursor`）启用两阶段覆盖索引删除：先按覆盖索引 SELECT 候选主键，再按主键 `IN` 删除，避免回表。**仅支持 DELETE**。
+- `--partition-concurrency` 在上述 fast-path 基础上，按表分区并发删除（**仅 OceanBase、需分区表**）。每个 worker 独占一个分区、各自维护游标，并通过 `PARTITION(...)` 限定范围；`<=1` 时回退为单 worker。
+  限流器（令牌桶 + `--rows-per-sec`）在所有 worker 间共享，因此限制的是**全局**速率；从库延迟暂停会让所有 worker 一起暂停。
+
+### 6. TiDB `_tidb_rowid` 清理（`--tidb-rowid`）
+- TiDB 专属：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主键/唯一键**的 TiDB **NONCLUSTERED（非聚簇）** 表也能分批 DELETE（默认 RangeStrategy 找不到 PK/UK 会直接报错）。
+- 采用 seek 游标 + `_tidb_rowid IN (...)` 删除，对 `SHARD_ROW_ID_BITS`/`AUTO_RANDOM` 稀疏 rowid 健壮；始终复用冻结后的 WHERE。**仅 DELETE**；显式开关，不改 TiDB 默认行为；与覆盖快路径/分区并发/`--force-chunking-column` 互斥。
+- 运行时校验适用性，CLUSTERED 表清晰报错。
+
+更详细的说明见 [`doc/design/cli-usage.md`](doc/design/cli-usage.md) 与 [`doc/design/sdk-usage.md`](doc/design/sdk-usage.md)。
+
+
 ## 使用方法
 ```bash
 $ ./goc run --help
@@ -69,6 +91,7 @@ Flags:
       --cpuprofile file                write cpu profile to file
   -d, --database string                Database name (required unless table is fully qualified)
       --debug                          If debug_mode is true, print debug logs
+      --dry-run                        Print sample SQL without executing
       --exclude-slaves string          which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.
                                        ex: ip or ip1,ip2,... without port
   -e, --execute string                 Query to execute, which must contain where clause
@@ -77,16 +100,27 @@ Flags:
   -H, --host string                    MySQL host (default "localhost")
       --include-slaves string          which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.
                                        ex: ip or ip1,ip2,... without port
+      --max-duration-ms int            Stop after this many milliseconds (0=unlimited)
       --max-lag int                    Pause chunk dml if the slave reach Threshold.
+      --max-rows int                   Stop after acting on this many rows (0=unlimited)
       --memprofile file                write memory profile to file
+      --no-slaves                      If true: don't calculate lags on slaves
       --noConsiderLag                  If true: sleep value will not be overshoot
                                        false: if slave lag is very high, sleep will be overshoot
+      --partition-concurrency int      OceanBase only: run the covering-index DELETE across table partitions with this many parallel workers (0/1=off)
   -p, --password string                MySQL password
   -P, --port int                       TCP/IP port (default 3306)
+      --preflight-threshold int        EXPLAIN large-table confirmation threshold (0=default 100000)
       --print-progress                 Show number of affected rows during utility runtime
-      --sleep int                      Number of seconds to sleep between chunks.
+      --rows-per-sec int               Cap rows acted on per second (0=unlimited)
+      --select-cursor                  Use a cursor to advance the candidate SELECT, avoiding a re-scan from the start
+      --select-index string            FORCE INDEX name for the two-phase candidate SELECT (covering index strategy)
+      --select-order-by string         Order columns for the two-phase candidate SELECT (comma-separated). Enables covering-index fast-path (DELETE only)
+      --sleep int                      Number of milliseconds to sleep between chunks.
+      --tidb-rowid                     TiDB only: chunk DELETE by the hidden _tidb_rowid handle (NONCLUSTERED tables, no PK/UK required)
       --txn-size int                   Number of rows per transaction. (default 1000)
   -u, --user string                    MySQL user (default "root")
+      --yes                            Skip the large-table confirmation prompt
 ```
 
 Sample:
@@ -104,6 +138,25 @@ $ ./goc run --chunk-size 1000 --txn-size 2000 -d test -t mybenchx0 \
 --host 127.0.0.1 --port 3306 \
 --user root --password 'xxx' \
 --sleep 1 --noConsiderLag
+
+# 限制每秒删除行数（与 sleep / max-lag 叠加生效），并设置行数上限
+$ ./goc run --chunk-size 1000 -d test \
+--execute "delete from mybenchx0 where created_at <= '2024-02-21 00:03:13'" \
+--host 127.0.0.1 --port 3306 --user root --password 'xxx' \
+--rows-per-sec 50000 --max-rows 2000000
+
+# OceanBase 覆盖索引 fast-path + 分区并发删除（DELETE only）
+$ ./goc run --chunk-size 1000 -d test \
+--execute "delete from mybenchx0 where created_at <= '2024-02-21 00:03:13'" \
+--host 127.0.0.1 --port 3306 --user root --password 'xxx' \
+--select-order-by created_at --select-cursor \
+--partition-concurrency 4
+
+# TiDB 无主键表按 _tidb_rowid 分块删除（DELETE only）
+$ ./goc run --tidb-rowid --chunk-size 1000 -d test \
+--execute "delete from rule_set_exe_history where create_time <= date_sub(now(), interval 15 day)" \
+--host 127.0.0.1 --port 4000 --user root --password 'xxx' \
+--print-progress
 ```
 
 ## 压测结果

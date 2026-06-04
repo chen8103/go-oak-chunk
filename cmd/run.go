@@ -45,6 +45,23 @@ var (
 	debug         bool
 	noConsiderLag bool
 	maxLag        int64
+	rowsPerSec    int64
+
+	// P2 flags
+	selectIndex        string
+	selectOrderBy      string
+	selectCursor       bool
+	maxRows            int64
+	maxDurationMs      int64
+	dryRun             bool
+	preflightThreshold int64
+	autoConfirm        bool
+
+	// P3 flags
+	partitionConcurrency int
+
+	// P4 flags
+	tidbRowID bool
 )
 
 var runCmd = &cobra.Command{
@@ -85,7 +102,20 @@ var runCmd = &cobra.Command{
 				Debug:         debug,
 				NoConsiderLag: noConsiderLag,
 				TxnSize:       txnSize,
+				RowsPerSec:    rowsPerSec,
 				Correct:       50,
+
+				SelectIndex:        selectIndex,
+				SelectOrderBy:      selectOrderBy,
+				SelectCursor:       selectCursor,
+				MaxRows:            maxRows,
+				MaxDuration:        maxDurationMs,
+				DryRun:             dryRun,
+				PreflightThreshold: preflightThreshold,
+				AutoConfirm:        autoConfirm,
+
+				PartitionConcurrency: partitionConcurrency,
+				TiDBRowID:            tidbRowID,
 			}
 			if err = config.PreCheck(); err != nil {
 				log.Logger.Errorf("config precheck failed [host=%s, database=%s]: %v", host, database, err)
@@ -162,6 +192,26 @@ func initRun() {
 	runCmd.Flags().Int64Var(&txnSize, "txn-size", 1000, "Number of rows per transaction.")
 	runCmd.Flags().Int64Var(&maxLag, "max-lag", 0, "Pause chunk dml if the slave reach Threshold.")
 	runCmd.Flags().BoolVar(&debug, "debug", false, "If debug_mode is true, print debug logs")
+	runCmd.Flags().Int64Var(&rowsPerSec, "rows-per-sec", 0, "Cap rows acted on per second (0=unlimited)")
+
+	// P2: OB covering-index fast-path (DELETE only) and shared guardrails.
+	runCmd.Flags().StringVar(&selectIndex, "select-index", "", "FORCE INDEX name for the two-phase candidate SELECT (covering index strategy)")
+	runCmd.Flags().StringVar(&selectOrderBy, "select-order-by", "", "Order columns for the two-phase candidate SELECT (comma-separated). Enables covering-index fast-path (DELETE only)")
+	runCmd.Flags().BoolVar(&selectCursor, "select-cursor", false, "Use a cursor to advance the candidate SELECT, avoiding a re-scan from the start")
+	runCmd.Flags().Int64Var(&maxRows, "max-rows", 0, "Stop after acting on this many rows (0=unlimited)")
+	runCmd.Flags().Int64Var(&maxDurationMs, "max-duration-ms", 0, "Stop after this many milliseconds (0=unlimited)")
+	runCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print sample SQL without executing")
+	runCmd.Flags().Int64Var(&preflightThreshold, "preflight-threshold", 0, "EXPLAIN large-table confirmation threshold (0=default 100000)")
+	runCmd.Flags().BoolVar(&autoConfirm, "yes", false, "Skip the large-table confirmation prompt")
+
+	// P3: OceanBase partition-parallel covering DELETE.
+	runCmd.Flags().IntVar(&partitionConcurrency, "partition-concurrency", 0,
+		"OceanBase only: run the covering-index DELETE across table partitions with this many parallel workers (0/1=off)")
+
+	// P4: TiDB _tidb_rowid chunked DELETE.
+	runCmd.Flags().BoolVar(&tidbRowID, "tidb-rowid", false,
+		"TiDB only: chunk DELETE by the hidden _tidb_rowid handle (NONCLUSTERED tables, no PK/UK required)")
+
 	rootCmd.AddCommand(runCmd)
 }
 

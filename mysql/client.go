@@ -17,8 +17,15 @@ func NewMysqlClient(t *conf.Config) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(10)
+	// 分区并发策略每个 worker 至少占用一条连接(SELECT + DELETE 事务),
+	// 再加上元信息/从库延迟探测借用的连接, 所以连接上限随并发抬高,
+	// 并预留 2 条余量。非分区路径(PartitionConcurrency<=0)保持原来的 10。
+	maxConns := 10
+	if t.PartitionConcurrency+2 > maxConns {
+		maxConns = t.PartitionConcurrency + 2
+	}
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
 	return db, nil
 }
 

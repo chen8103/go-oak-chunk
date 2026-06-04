@@ -191,6 +191,96 @@ func enqueueOneBatchAndFinish(w *Writer) {
 	w.ProducerQueue <- &Producer{IsFinished: true}
 }
 
+// enqueueNBatches 在后台 goroutine 里持续投递批次, 避免 ProducerQueue
+// 缓冲满时阻塞测试主协程(消费者在护栏触发后会停止消费)。
+func enqueueNBatches(w *Writer, n int) {
+	go func() {
+		for i := 0; i < n; i++ {
+			select {
+			case w.ProducerQueue <- &Producer{
+				WhereClause: "`id` = ?",
+				CurrentKeyValues: []*KeyValue{
+					{ColumnName: "id", ColumnValue: int64(i + 1)},
+				},
+			}:
+			case <-time.After(3 * time.Second):
+				return
+			}
+		}
+	}()
+}
+
+func TestWriterWrite_MaxRowsStops(t *testing.T) {
+	db, state := newWriterTestDB(t, writerExecPlan{rowsAffected: 1})
+	w := newWriterForTest(db)
+	w.TxnSize = 1 // one row per tx -> guardrail evaluated每个事务后
+	w.MaxRows = 3
+	// 排入远多于 MaxRows 的批次, 且不投递 IsFinished, 确保停止来自护栏。
+	enqueueNBatches(w, 50)
+
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Write(context.Background(),
+			ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on max-rows stop, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting writer.Write to stop on max-rows")
+	}
+
+	if !w.IsFinished() {
+		t.Fatalf("expected writer to be finished after max-rows")
+	}
+	if got := w.GetRowAffects(); got < w.MaxRows {
+		t.Fatalf("expected rowAffects >= MaxRows(%d), got %d", w.MaxRows, got)
+	}
+	// 事务边界停止: 每事务 1 行, 不应溢出超过一个 txn-size。
+	if got := w.GetRowAffects(); got > w.MaxRows {
+		t.Fatalf("expected rowAffects == MaxRows(%d) with txn-size=1, got %d", w.MaxRows, got)
+	}
+	if _, execCalls := snapshotDriverCounters(state); execCalls != int(w.MaxRows) {
+		t.Fatalf("expected exactly %d exec calls, got %d", w.MaxRows, execCalls)
+	}
+}
+
+func TestWriterWrite_MaxDurationStops(t *testing.T) {
+	db, _ := newWriterTestDB(t, writerExecPlan{rowsAffected: 1})
+	w := newWriterForTest(db)
+	w.TxnSize = 1
+	w.MaxDuration = 50 * time.Millisecond
+	enqueueNBatches(w, 100000)
+
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- w.Write(context.Background(),
+			ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
+	}()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on max-duration stop, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout waiting writer.Write to stop on max-duration")
+	}
+
+	if !w.IsFinished() {
+		t.Fatalf("expected writer to be finished after max-duration")
+	}
+}
+
 func snapshotTxState(state *writerDriverState) []*writerTxState {
 	state.mu.Lock()
 	defer state.mu.Unlock()
@@ -276,7 +366,7 @@ func TestWriterWrite_RetryAndCancellationRisks(t *testing.T) {
 
 			errCh := make(chan error, 1)
 			go func() {
-				errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum)
+				errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), bucketNum, nil)
 			}()
 
 			if tt.cancelOnExecCall >= 0 {
@@ -326,7 +416,7 @@ func TestWriterWrite_CancelWhileWaitingProducerRollsBack(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), make(chan int64, 1))
+		errCh <- w.Write(ctx, ratelimit.NewBucketWithQuantum(1*time.Millisecond, 1, 1), make(chan int64, 1), nil)
 	}()
 
 	select {
@@ -383,6 +473,8 @@ type getInfoCall struct {
 type getInfoPlan struct {
 	version        string
 	versionErr     error
+	dbNowLiteral   string
+	dbNowErr       error
 	setSessionErr  error
 	createTableDDL string
 	showCreateErr  error
@@ -466,6 +558,21 @@ func (c *getInfoFakeConn) QueryContext(
 			columns: []string{"version()"},
 			rows: [][]driver.Value{
 				{[]byte(version)},
+			},
+		}, nil
+	case strings.Contains(lowerQuery, "date_format(now()"):
+		plan := c.recordCall("db_now")
+		if plan.dbNowErr != nil {
+			return nil, plan.dbNowErr
+		}
+		literal := plan.dbNowLiteral
+		if literal == "" {
+			literal = "2026-06-03 12:00:00"
+		}
+		return &getInfoFakeRows{
+			columns: []string{"DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')"},
+			rows: [][]driver.Value{
+				{[]byte(literal)},
 			},
 		}, nil
 	case strings.Contains(lowerQuery, "show create table"):
@@ -663,6 +770,29 @@ func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
 	}
 }
 
+func TestWriterGetInfoFromTable_FreezeNowUsesDatabaseTime(t *testing.T) {
+	db, state := newGetInfoTestDB(t, getInfoPlan{
+		version:      "8.0.36",
+		dbNowLiteral: "2026-06-03 18:19:20",
+	})
+	w := newWriterGetInfoForTest(db)
+	w.ExecuteSQL = "DELETE FROM `t1` WHERE `create_time` <= date_sub(now(), interval 15 day)"
+
+	err := w.getInfoFromTable(&conf.Config{
+		ExecuteQuery: w.ExecuteSQL,
+	})
+	if err != nil {
+		t.Fatalf("getInfoFromTable returned err: %v", err)
+	}
+	if !strings.Contains(w.OriginWhereClause, "2026-06-03 18:19:20") {
+		t.Fatalf("OriginWhereClause should contain DB current time literal, got: %s", w.OriginWhereClause)
+	}
+	if strings.Contains(strings.ToLower(w.OriginWhereClause), "now(") {
+		t.Fatalf("OriginWhereClause should not keep NOW(), got: %s", w.OriginWhereClause)
+	}
+	assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "db_now", "show_create"})
+}
+
 func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
 	t.Run("version_query_failed", func(t *testing.T) {
 		db, state := newGetInfoTestDB(t, getInfoPlan{
@@ -676,6 +806,22 @@ func TestWriterGetInfoFromTable_ErrorPaths(t *testing.T) {
 			t.Fatalf("expected query version failed error, got: %v", err)
 		}
 		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version"})
+	})
+
+	t.Run("db_now_query_failed", func(t *testing.T) {
+		db, state := newGetInfoTestDB(t, getInfoPlan{
+			version:  "8.0.36",
+			dbNowErr: errors.New("db now failed"),
+		})
+		w := newWriterGetInfoForTest(db)
+		w.ExecuteSQL = "DELETE FROM `t1` WHERE `create_time` <= now()"
+		err := w.getInfoFromTable(&conf.Config{
+			ExecuteQuery: w.ExecuteSQL,
+		})
+		if err == nil || !strings.Contains(err.Error(), "query database current time failed") {
+			t.Fatalf("expected query database current time failed error, got: %v", err)
+		}
+		assertGetInfoCalls(t, snapshotGetInfoCalls(state), []string{"version", "db_now"})
 	})
 
 	t.Run("oceanbase_set_session_failed", func(t *testing.T) {
