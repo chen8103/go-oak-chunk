@@ -9,7 +9,7 @@
 
 ### v3.2.0(20260602)
 #### feature:
-1. NOW() 冻结：执行前将 SQL 中的 `NOW()`/`CURRENT_TIMESTAMP` 等时间函数固化为单一时刻，保证长任务跨 chunk 的时间边界一致（`mysql/freeze.go`）
+1. NOW() 冻结：执行前将 SQL 中的 `NOW()`/`CURRENT_TIMESTAMP` 等时间函数固化为单一时刻，保证长任务跨 chunk 的时间边界一致；冻结时间来自 DB session，查询数据库当前时间或还原冻结 literal 失败时会直接终止任务，不再降级使用原始 WHERE（`mysql/freeze.go`）
 2. OceanBase 错误分类 + 指数退避重试：区分可重试/不可重试错误，仅在事务尚未产生行变更时安全重试（`internal/retry`）
 3. 解析器升级：由 soar+pingcap 迁移到 `tidb/parser`，并抽出 `ChunkStrategy` 策略接口，为多策略/并发预留扩展点
 4. 覆盖索引两阶段快路径（仅 DELETE）：先按覆盖索引 SELECT 候选主键、再按主键 `IN` 删除，避免回表；新增 `--select-order-by`/`--select-index`/`--select-cursor`（`OBCoveringStrategy`）

@@ -22,6 +22,11 @@ type rangeStrategyFakeState struct {
 	rows       int
 	queryCalls int
 	execCalls  int
+
+	blockQueryCall    int
+	blockQueryStarted chan struct{}
+	blockQueryErr     error
+	blockQueryOnce    sync.Once
 }
 
 type rangeStrategyFakeDriver struct {
@@ -64,7 +69,7 @@ func (c *rangeStrategyFakeConn) BeginTx(_ context.Context, _ driver.TxOptions) (
 }
 
 func (c *rangeStrategyFakeConn) QueryContext(
-	_ context.Context, query string, _ []driver.NamedValue,
+	ctx context.Context, query string, _ []driver.NamedValue,
 ) (driver.Rows, error) {
 	if !strings.Contains(strings.ToUpper(query), "SELECT") {
 		return nil, fmt.Errorf("unexpected query: %s", query)
@@ -72,8 +77,25 @@ func (c *rangeStrategyFakeConn) QueryContext(
 
 	c.state.mu.Lock()
 	c.state.queryCalls++
+	queryCall := c.state.queryCalls
 	rowCount := c.state.rows
+	blockQueryCall := c.state.blockQueryCall
+	blockQueryStarted := c.state.blockQueryStarted
+	blockQueryErr := c.state.blockQueryErr
 	c.state.mu.Unlock()
+
+	if blockQueryCall > 0 && queryCall == blockQueryCall {
+		if blockQueryStarted != nil {
+			c.state.blockQueryOnce.Do(func() {
+				close(blockQueryStarted)
+			})
+		}
+		<-ctx.Done()
+		if blockQueryErr != nil {
+			return nil, blockQueryErr
+		}
+		return nil, ctx.Err()
+	}
 
 	rows := make([][]driver.Value, 0, rowCount)
 	for i := 1; i <= rowCount; i++ {
@@ -189,6 +211,70 @@ func TestRangeStrategyRun_CancelsProducerWhenWriterStopsOnGuardrail(t *testing.T
 	state.mu.Unlock()
 	if queryCalls == 0 {
 		t.Fatal("expected producer to query candidate rows")
+	}
+	if execCalls != 1 {
+		t.Fatalf("execCalls = %d, want 1", execCalls)
+	}
+}
+
+func TestRangeStrategyRun_IgnoresProducerErrorAfterGuardrailCancelMidQuery(t *testing.T) {
+	db, state := newRangeStrategyTestDB(t, 1)
+	state.blockQueryCall = 2
+	state.blockQueryStarted = make(chan struct{})
+	state.blockQueryErr = fmt.Errorf("driver-specific query cancel")
+
+	w := &Writer{
+		MysqlClient:       db,
+		ExecuteSQL:        "DELETE FROM `t` WHERE (id > 0)",
+		OriginWhereClause: "(id > 0)",
+		ChunkSize:         1,
+		TxnSize:           1,
+		Database:          "d",
+		Table:             "t",
+		unqKeys: &UnqKeys{
+			UniqueKeyColumns: []string{"id"},
+			UniqueKeyTypes:   []byte{tidbmysql.TypeLonglong},
+			IsNull:           []bool{false},
+		},
+		ProducerQueue: make(chan *Producer, 8),
+		MaxRows:       1,
+	}
+
+	bucketNum := make(chan int64, 1)
+	bucketNum <- 0
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- NewRangeStrategy(w).Run(context.Background(), RunParams{
+			Bucket:    noopBucket{},
+			BucketNum: bucketNum,
+		})
+	}()
+
+	select {
+	case <-state.blockQueryStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("producer did not enter the mid-query cancel path")
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Run returned err: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run timed out after canceling producer mid-query")
+	}
+
+	if got := w.GetRowAffects(); got != 1 {
+		t.Fatalf("rowAffects = %d, want 1", got)
+	}
+	state.mu.Lock()
+	queryCalls := state.queryCalls
+	execCalls := state.execCalls
+	state.mu.Unlock()
+	if queryCalls != 2 {
+		t.Fatalf("queryCalls = %d, want 2", queryCalls)
 	}
 	if execCalls != 1 {
 		t.Fatalf("execCalls = %d, want 1", execCalls)
