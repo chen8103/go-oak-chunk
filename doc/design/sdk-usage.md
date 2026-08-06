@@ -1,5 +1,7 @@
 # go-oak-chunk SDK 使用手册（v3）
 
+[English](sdk-usage-en.md) | [简体中文](sdk-usage.md)
+
 ## 1. 文档目标
 
 这份文档说明如何把 `go-oak-chunk` 作为 **Go SDK** 嵌入你的服务，而不是只通过命令行运行。

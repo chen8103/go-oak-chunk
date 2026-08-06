@@ -1,5 +1,7 @@
 # go-oak-chunk CLI 使用手册（v3）
 
+[English](cli-usage-en.md) | [简体中文](cli-usage.md)
+
 ## 1. 文档目标
 
 这份文档用于说明如何以 **CLI（命令行）方式** 使用 `go-oak-chunk` 执行大表 `UPDATE/DELETE` 的分块 DML。
