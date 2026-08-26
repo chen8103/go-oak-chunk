@@ -91,7 +91,7 @@ Flags:
                                        The lower the number, the shorter any locks are held, but the more operations required and the more total running time. (default 1000)
   -c, --config string                  config file path
       --cpuprofile file                write cpu profile to file
-  -d, --database string                Database name (required unless table is fully qualified)
+  -d, --database string                Database name. Optional when --execute uses schema.table; if both are set, they must match exactly, including letter case
       --debug                          If debug_mode is true, print debug logs
       --dry-run                        Print sample SQL without executing
       --exclude-slaves string          which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.
@@ -125,7 +125,7 @@ Flags:
       --yes                            Skip the large-table confirmation prompt
 ```
 
-> 注意：当前实现仍要求显式提供 `--database`，即使 help 文案写着全限定表名可以省略数据库。
+> 当 `--execute` 使用全限定 `schema.table` 时可以省略 `--database`。如果两者同时提供，库名必须逐字一致（包括大小写），否则 `goc` 会在建立数据库连接前停止。
 
 Sample:
 ```bash

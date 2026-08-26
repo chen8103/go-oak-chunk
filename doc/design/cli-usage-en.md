@@ -90,7 +90,7 @@ go run ./cmd/go-oak-chunk run --help
 | `-P, --port` | int / `3306` | No | MySQL port | |
 | `-u, --user` | string / `root` | No | MySQL user | |
 | `-p, --password` | string / empty | No | MySQL password | |
-| `-d, --database` | string / empty | **Yes (current implementation)** | Target database name | The help text says it can be omitted for a fully qualified table, but the current implementation still requires it |
+| `-d, --database` | string / empty | Required unless SQL uses `schema.table` | Target database name | Must match the SQL schema exactly, including letter case, when both are provided |
 | `--txn-size` | int64 / `1000` | No | Maximum rows per transaction | Controls transaction size |
 | `--sleep` | int64 / `0` | No | Sleep between chunks (milliseconds) | Unit is **milliseconds** |
 | `--noConsiderLag` | bool / `false` | No | Whether to ignore lag-based sleep expansion | When `true`, sleep is not increased substantially |
@@ -201,7 +201,7 @@ The CLI performs the following important checks at startup:
 1. `chunk_size` must not be negative
 2. `execute_query` must not be empty
 3. `include_slaves` and `exclude_slaves` are mutually exclusive
-4. `database` must be non-empty in the current implementation
+4. `database` must be non-empty unless SQL uses `schema.table`; when both are provided, they must match exactly, including letter case
 5. The SQL must contain a single statement
 6. The SQL type must be `UPDATE` or `DELETE`
 7. The target table must exist
@@ -494,7 +494,8 @@ The algorithm uses a **seek cursor** (`_tidb_rowid > cursor`) rather than MIN/MA
 | `query to execute must be provided` | `--execute` was not provided or configuration is missing | Add the SQL |
 | `chunk size must be nonnegative` | `chunk-size < 0` | Change it to `>=0` |
 | `--include-slaves and --exclude-slaves are mutually exclusive` | Both options were set | Keep only one |
-| `no database specified` | `--database`/`database` is not set | Pass the database explicitly |
+| `no database specified` | `--database`/`database` is not set and SQL does not use `schema.table` | Pass the database explicitly or use a fully qualified table name |
+| `database mismatch` | `--database`/`database` does not exactly match the SQL schema, including letter case | Make both names identical; the tool stops before connecting |
 | `table xxx does not exist` | Wrong database or table name | Check `database` and the SQL |
 | `please confirm sql type is update or delete` | SQL is not UPDATE/DELETE | Use a supported type |
 | `can't find any index which is primary or unique key` | Target table has no primary/unique key | Add a unique key or change the table |
@@ -518,7 +519,7 @@ The algorithm uses a **seek cursor** (`_tidb_rowid > cursor`) rather than MIN/MA
 
 ## 16. Notes about the current implementation
 
-1. The help text says `database` can be omitted for a fully qualified table, but the current implementation still requires `database`
+1. `database` may be omitted when SQL uses `schema.table`; when both are provided, they must match exactly, including letter case
 2. `sleep` is measured in **milliseconds**, not seconds
 3. The configuration-file key is `forced_chunking_column`, not `force_chunking_column`
 4. Without a configuration file, the CLI automatically sets `correct` to `50`; in configuration-file mode, explicitly set `correct = 50`

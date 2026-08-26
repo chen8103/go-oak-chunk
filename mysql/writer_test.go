@@ -178,6 +178,15 @@ func newWriterForTest(db *sql.DB) *Writer {
 	}
 }
 
+func TestNewWriterPreservesExecuteQuery(t *testing.T) {
+	query := "UPDATE sales.orders SET note = 'a;b' WHERE id > 0;"
+	w := newWriter(&conf.Config{ExecuteQuery: query})
+
+	if w.ExecuteSQL != query {
+		t.Fatalf("ExecuteSQL = %q, want original query %q", w.ExecuteSQL, query)
+	}
+}
+
 func enqueueOneBatchAndFinish(w *Writer) {
 	w.ProducerQueue <- &Producer{
 		WhereClause: "`id` = ?",
@@ -766,6 +775,92 @@ func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
 			calls := snapshotGetInfoCalls(state)
 			assertGetInfoCalls(t, calls, tt.wantOps)
 			assertSingleConnUsed(t, calls)
+		})
+	}
+}
+
+func TestWriterGetInfoFromTable_QualifiesExecuteTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		database  string
+		table     string
+		query     string
+		wantStart string
+	}{
+		{
+			name:      "delete",
+			database:  "sales",
+			table:     "orders",
+			query:     "DELETE FROM sales.orders WHERE id > 0",
+			wantStart: "DELETE FROM `sales`.`orders` WHERE ",
+		},
+		{
+			name:      "update",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = 1 WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = 1 WHERE ",
+		},
+		{
+			name:      "update schema contains set",
+			database:  "asset",
+			table:     "orders",
+			query:     "UPDATE asset.orders SET status = 1 WHERE id > 0",
+			wantStart: "UPDATE `asset`.`orders` SET status = 1 WHERE ",
+		},
+		{
+			name:      "update preserves operator spelling",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = left_part || right_part WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = left_part || right_part WHERE ",
+		},
+		{
+			name:      "update preserves semicolon in string literal",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET note = 'a;b' WHERE id > 0;",
+			wantStart: "UPDATE `sales`.`orders` SET note = 'a;b' WHERE ",
+		},
+		{
+			name:      "update ignores where in nested expression",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = (SELECT max(status) FROM archive WHERE archive.id = orders.id) WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = (SELECT max(status) FROM archive WHERE archive.id = orders.id) WHERE ",
+		},
+		{
+			name:      "update ignores keywords in literals and comments",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders /* SET fake */ SET note = 'WHERE and SET' /* WHERE fake */ WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET note = 'WHERE and SET' /* WHERE fake */ WHERE ",
+		},
+		{
+			name:      "escaped identifiers",
+			database:  "sales`archive",
+			table:     "order`items",
+			query:     "DELETE FROM `sales``archive`.`order``items` WHERE id > 0",
+			wantStart: "DELETE FROM `sales``archive`.`order``items` WHERE ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _ := newGetInfoTestDB(t, getInfoPlan{version: "8.0.36"})
+			w := &Writer{
+				MysqlClient: db,
+				ExecuteSQL:  tt.query,
+				Database:    tt.database,
+				Table:       tt.table,
+			}
+
+			if err := w.getInfoFromTable(&conf.Config{ExecuteQuery: tt.query}); err != nil {
+				t.Fatalf("getInfoFromTable returned err: %v", err)
+			}
+			if !strings.HasPrefix(w.ExecuteSQL, tt.wantStart) {
+				t.Fatalf("ExecuteSQL = %q, want prefix %q", w.ExecuteSQL, tt.wantStart)
+			}
 		})
 	}
 }

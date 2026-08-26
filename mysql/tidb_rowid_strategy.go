@@ -393,7 +393,7 @@ func (s *TiDBRowIDStrategy) whereClause() string {
 
 // defaultTableRef returns "`db`.`table`".
 func (s *TiDBRowIDStrategy) defaultTableRef() string {
-	return fmt.Sprintf("`%s`.`%s`", s.writer.Database, s.writer.Table)
+	return QualifiedTableName(s.writer.Database, s.writer.Table)
 }
 
 // PrintDryRunSample logs a sample SELECT and DELETE without executing them.

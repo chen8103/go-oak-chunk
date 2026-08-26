@@ -1,3 +1,14 @@
+### v3.4.0(20260826)
+#### feature:
+1. CLI 与 SDK 支持从单表 `UPDATE`/`DELETE` 的全限定 `schema.table` 推断目标库，省略 `--database`/`Config.Database` 时会统一使用并回填 SQL schema
+
+#### bugFix:
+1. UPDATE 执行模板按 SQL 词法边界提取并原样保留 `SET` 赋值文本，AST 继续负责语句与目标结构校验；避免 schema 或表名包含 `set` 时被截断，也避免 AST Restore 改写操作符和字符串字面量
+2. 不再在 Writer 初始化阶段全局删除 SQL 中的分号，避免 `SET` 字符串字面量里的分号被移除
+
+#### note:
+1. `--database`/`Config.Database` 与 SQL schema 同时提供时必须逐字一致（包括大小写），不一致会在建立数据库连接前失败；已有依赖“配置库覆盖 SQL schema”的调用需要统一两处库名
+
 ### v3.3.0(20260603)
 #### feature:
 1. 新增 TiDB 专属清理策略 `--tidb-rowid`（SDK `WithTiDBRowID`）：按 TiDB 隐藏行句柄 `_tidb_rowid` 分块 DELETE，让**无主键/唯一键**的 TiDB 非聚簇（NONCLUSTERED）表也能高效分批清理（`mysql/tidb_rowid_strategy.go`）

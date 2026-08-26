@@ -195,13 +195,43 @@ func handleColumnValue(scanArgs []interface{}, cols []string, keyCol string, tp 
 	}
 }
 
+// TableRef identifies the optional schema and table parsed from a DML target.
+type TableRef struct {
+	Schema string
+	Table  string
+}
+
+func resolveTargetDatabase(configured, sqlSchema string) (string, error) {
+	switch {
+	case configured == "" && sqlSchema == "":
+		return "", fmt.Errorf("no database specified. specify Database with -d or --database, or qualify the table as schema.table")
+	case configured == "":
+		return sqlSchema, nil
+	case sqlSchema == "":
+		return configured, nil
+	case configured != sqlSchema:
+		return "", fmt.Errorf("database mismatch: --database=%q, SQL schema=%q", configured, sqlSchema)
+	default:
+		return configured, nil
+	}
+}
+
 func TableMetaInfo(sql string) (string, error) {
-	tree, _, err := parser.New().ParseSQL(sql)
+	ref, err := TargetTableMeta(sql)
 	if err != nil {
 		return "", err
 	}
+	return ref.Table, nil
+}
+
+// TargetTableMeta parses the target schema and table from UPDATE or DELETE SQL.
+func TargetTableMeta(sql string) (TableRef, error) {
+	tree, _, err := parser.New().ParseSQL(sql)
+	if err != nil {
+		return TableRef{}, err
+	}
 	if len(tree) == 0 {
-		return "", errors.New("SQL got wrong : " + sql)
+		return TableRef{}, errors.New("SQL got wrong : " + sql)
 	}
 
 	node := tree[0]
@@ -221,29 +251,29 @@ func TableMetaInfo(sql string) (string, error) {
 			refs = n.TableRefs.TableRefs
 		}
 	default:
-		return "", errors.New("Not supported sql type: " + sql)
+		return TableRef{}, errors.New("Not supported sql type: " + sql)
 	}
 
-	if name := firstTableName(refs); name != "" {
-		return name, nil
+	if ref := firstTableRef(refs); ref.Table != "" {
+		return ref, nil
 	}
-	return "", errors.New("SQL got wrong : " + sql)
+	return TableRef{}, errors.New("SQL got wrong : " + sql)
 }
 
-// firstTableName returns the name of the leftmost table referenced in a join
+// firstTableRef returns the leftmost table referenced in a join
 // tree, mirroring the previous JSON traversal which picked the first
 // TableRefs > Source > Name.O it encountered.
-func firstTableName(node ast.ResultSetNode) string {
+func firstTableRef(node ast.ResultSetNode) TableRef {
 	switch n := node.(type) {
 	case *ast.Join:
-		if name := firstTableName(n.Left); name != "" {
-			return name
+		if ref := firstTableRef(n.Left); ref.Table != "" {
+			return ref
 		}
-		return firstTableName(n.Right)
+		return firstTableRef(n.Right)
 	case *ast.TableSource:
-		return firstTableName(n.Source)
+		return firstTableRef(n.Source)
 	case *ast.TableName:
-		return n.Name.O
+		return TableRef{Schema: n.Schema.O, Table: n.Name.O}
 	}
-	return ""
+	return TableRef{}
 }

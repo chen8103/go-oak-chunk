@@ -143,7 +143,7 @@ func main() {
 | 字段 | 类型 | 默认/建议 | 说明 |
 |---|---|---|---|
 | `ExecuteQuery` | `string` | 必填 | 单条 `UPDATE/DELETE` SQL |
-| `Database` | `string` | 必填 | 当前实现要求非空 |
+| `Database` | `string` | SQL 未使用 `schema.table` 时必填 | 与 SQL schema 同时提供时必须逐字一致，包括大小写；省略时会把 SQL schema 回填到此字段 |
 | `Host` | `string` | 必填 | 主库地址 |
 | `Port` | `int` | 必填 | 主库端口 |
 | `User` | `string` | 必填 | 用户名 |
@@ -180,7 +180,7 @@ func main() {
 - `ExecuteQuery` 非空
 - `IncludeSlaves` 与 `ExcludeSlaves` 互斥
 
-> 注意：`Database` 非空检查在 writer 初始化阶段做，不在 `PreCheck` 里。
+> 注意：目标数据库在 writer 初始化阶段解析，不在 `PreCheck` 里。SQL 使用 `schema.table` 时允许 `Database` 为空，解析出的 schema 会回填到 `cfg.Database`，供主库连接、从库延迟检查和状态输出统一使用。
 
 ### 6.3 与 CLI 的一个细微差异
 
@@ -484,7 +484,8 @@ oaklog.NewFromSugaredLogger(sugar)
 |---|---|---|
 | `executor can only run once` | 同实例重复 `Run` | 每次任务创建新 `Executor` |
 | 返回 `task.ErrExecutionStopped` | 主动 `Stop`/`cancel`/超时 | 作为正常停止处理 |
-| `no database specified` | `Database` 空 | 显式设置 `cfg.Database` |
+| `no database specified` | `Database` 为空，SQL 也未使用 `schema.table` | 显式设置 `cfg.Database`，或使用全限定表名 |
+| `database mismatch` | `Database` 与 SQL schema 未逐字一致（包括大小写） | 将两者改为完全相同的库名；初始化会在连接前停止 |
 | `please confirm sql type is update or delete` | SQL 类型不支持 | 仅使用单条 Update/Delete |
 | `can't find any index which is primary or unique key` | 表无唯一键 | 增加主键/唯一键 |
 | `forced_chunking_column doesn't conform ...` | 指定列不匹配唯一键 | 使用真实唯一键列集合 |

@@ -258,7 +258,7 @@ func runPreflight(ctx context.Context, config *conf.Config, writer *mysql.Writer
 		threshold = preflight.DefaultLargeTableThreshold
 	}
 
-	table := fmt.Sprintf("`%s`.`%s`", writer.Database, writer.Table)
+	table := mysql.QualifiedTableName(writer.Database, writer.Table)
 	estimated, err := preflight.EstimateRows(ctx, writer.MysqlClient, table, writer.OriginWhereClause)
 	if err != nil {
 		log.Logger.Warnf("preflight EXPLAIN failed (continuing): %v", err)
