@@ -2,6 +2,8 @@ package mysql
 
 import (
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/SisyphusSQ/go-oak-chunk/v3/conf"
@@ -67,6 +69,50 @@ func TestWriterResolveTargetFromQualifiedSQL(t *testing.T) {
 	}
 	if c.Database != "sales" {
 		t.Fatalf("resolved config database = %q, want sales", c.Database)
+	}
+}
+
+func TestWriterResolveTargetDoesNotRewriteConfiguredDatabase(t *testing.T) {
+	c := &conf.Config{
+		Database:     "sales",
+		ExecuteQuery: "DELETE FROM sales.orders WHERE id > 0",
+	}
+	w := &Writer{ExecuteSQL: c.ExecuteQuery}
+
+	ready := make(chan struct{})
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var readyOnce sync.Once
+	var changed atomic.Bool
+	go func() {
+		defer close(done)
+		for {
+			configured := c.Database
+			readyOnce.Do(func() { close(ready) })
+			if configured != "sales" {
+				changed.Store(true)
+			}
+			select {
+			case <-stop:
+				return
+			default:
+			}
+		}
+	}()
+
+	<-ready
+	for range 10_000 {
+		if err := w.resolveTarget(c); err != nil {
+			close(stop)
+			<-done
+			t.Fatalf("resolveTarget() error = %v", err)
+		}
+	}
+	close(stop)
+	<-done
+
+	if changed.Load() {
+		t.Fatalf("configured database changed to %q", c.Database)
 	}
 }
 

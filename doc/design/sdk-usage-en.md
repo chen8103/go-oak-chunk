@@ -143,7 +143,7 @@ func main() {
 | Field | Type | Default/recommendation | Description |
 |---|---|---|---|
 | `ExecuteQuery` | `string` | Required | Single-statement `UPDATE/DELETE` SQL |
-| `Database` | `string` | Required unless SQL uses `schema.table` | Must match the SQL schema when both are provided |
+| `Database` | `string` | Required unless SQL uses `schema.table` | Must match the SQL schema exactly, including letter case, when both are provided; when omitted, the inferred schema is written back to this field |
 | `Host` | `string` | Required | Primary address |
 | `Port` | `int` | Required | Primary port |
 | `User` | `string` | Required | Username |
@@ -180,7 +180,7 @@ func main() {
 - `ExecuteQuery` is not empty
 - `IncludeSlaves` and `ExcludeSlaves` are mutually exclusive
 
-> Note: the non-empty `Database` check happens during writer initialization, not inside `PreCheck`.
+> Note: target-database resolution happens during writer initialization, not inside `PreCheck`. When SQL uses `schema.table`, `Database` may be empty; the inferred schema is written back to `cfg.Database` so primary connections, replica-lag checks, and status output use one value.
 
 ### 6.3 A subtle CLI difference
 
@@ -484,7 +484,8 @@ This is suitable for sending SDK logs into your existing logging platform and tr
 |---|---|---|
 | `executor can only run once` | `Run` called more than once on the same instance | Create a new `Executor` for each task |
 | `task.ErrExecutionStopped` returned | Active `Stop`/`cancel`/timeout | Treat it as a normal stop |
-| `no database specified` | `Database` is empty | Set `cfg.Database` explicitly |
+| `no database specified` | `Database` is empty and SQL does not use `schema.table` | Set `cfg.Database` explicitly or use a fully qualified table name |
+| `database mismatch` | `Database` does not exactly match the SQL schema, including letter case | Make both names identical; initialization stops before connecting |
 | `please confirm sql type is update or delete` | Unsupported SQL type | Use a single UPDATE/DELETE statement |
 | `can't find any index which is primary or unique key` | Table has no unique key | Add a primary/unique key |
 | `forced_chunking_column doesn't conform ...` | Specified columns do not match a unique key | Use the actual unique-key column set |

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -92,21 +91,25 @@ type showIndexRow struct {
 }
 
 func NewWriter(c *conf.Config) (*Writer, error) {
+	w := newWriter(c)
+	if err := w.preCheck(c); err != nil {
+		return nil, err
+	}
+	return w, nil
+}
+
+func newWriter(c *conf.Config) *Writer {
 	w := &Writer{
 		noLogBing:     c.NoLogBin,
 		ChunkSize:     c.ChunkSize,
 		TxnSize:       c.TxnSize,
-		ExecuteSQL:    strings.ReplaceAll(c.ExecuteQuery, ";", ""),
+		ExecuteSQL:    c.ExecuteQuery,
 		ProducerQueue: make(chan *Producer, 1000),
 		MaxRows:       c.MaxRows,
 		MaxDuration:   time.Duration(c.MaxDuration) * time.Millisecond,
 	}
 	w.SetCostTime(1 * time.Second)
-
-	if err := w.preCheck(c); err != nil {
-		return nil, err
-	}
-	return w, nil
+	return w
 }
 
 func (w *Writer) preCheck(c *conf.Config) error {
@@ -144,7 +147,8 @@ func (w *Writer) resolveTarget(c *conf.Config) error {
 		return fmt.Errorf("failed to parse table info: %w", err)
 	}
 
-	database, err := resolveTargetDatabase(c.Database, ref.Schema)
+	configuredDatabase := c.Database
+	database, err := resolveTargetDatabase(configuredDatabase, ref.Schema)
 	if err != nil {
 		return err
 	}
@@ -153,7 +157,9 @@ func (w *Writer) resolveTarget(c *conf.Config) error {
 	w.Table = ref.Table
 	// Config is shared with the task and slave-lag paths. Normalize it once so
 	// every connection and status message uses the same resolved database.
-	c.Database = database
+	if configuredDatabase == "" {
+		c.Database = database
+	}
 	return nil
 }
 
@@ -352,9 +358,15 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		node.Accept(v)
 		whereNode = n.Where
 
-		re := regexp.MustCompile(`set.*where|SET.*WHERE|set.*WHERE|SET.*where`)
-		sub := re.FindString(c.ExecuteQuery)
-		w.ExecuteSQL = fmt.Sprintf("UPDATE %s %s ", QualifiedTableName(w.Database, w.Table), sub)
+		setClause, extractErr := extractUpdateSetClause(w.ExecuteSQL)
+		if extractErr != nil {
+			return extractErr
+		}
+		w.ExecuteSQL = fmt.Sprintf(
+			"UPDATE %s SET %s WHERE ",
+			QualifiedTableName(w.Database, w.Table),
+			setClause,
+		)
 	default:
 		return fmt.Errorf("please confirm sql type is update or delete")
 	}
@@ -531,6 +543,118 @@ func (w *Writer) enableOceanBaseDDLCompatMode(
 		return fmt.Errorf("set oceanbase ddl compat mode failed: %w", err)
 	}
 	return nil
+}
+
+// extractUpdateSetClause returns the user's assignment text without asking the
+// AST restorer to reinterpret operators, literals, or SQL-mode-sensitive text.
+func extractUpdateSetClause(sqlText string) (string, error) {
+	setEnd := -1
+	depth := 0
+
+	for i := 0; i < len(sqlText); {
+		switch sqlText[i] {
+		case '\'', '"', '`':
+			i = skipSQLQuotedText(sqlText, i)
+		case '#':
+			i = skipSQLLineComment(sqlText, i+1)
+		case '-':
+			if i+1 < len(sqlText) && sqlText[i+1] == '-' &&
+				(i+2 == len(sqlText) || sqlText[i+2] <= ' ') {
+				i = skipSQLLineComment(sqlText, i+2)
+				continue
+			}
+			i++
+		case '/':
+			if i+1 < len(sqlText) && sqlText[i+1] == '*' {
+				commentEnd := strings.Index(sqlText[i+2:], "*/")
+				if commentEnd < 0 {
+					return "", fmt.Errorf("unterminated SQL block comment")
+				}
+				i += commentEnd + 4
+				continue
+			}
+			i++
+		case '(':
+			depth++
+			i++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+		case ';':
+			if depth == 0 && setEnd >= 0 {
+				return nonEmptyUpdateSetClause(sqlText[setEnd:i])
+			}
+			i++
+		default:
+			if depth != 0 || !isSQLWordByte(sqlText[i]) {
+				i++
+				continue
+			}
+
+			wordStart := i
+			for i < len(sqlText) && isSQLWordByte(sqlText[i]) {
+				i++
+			}
+			word := sqlText[wordStart:i]
+			if setEnd < 0 {
+				if strings.EqualFold(word, "SET") {
+					setEnd = i
+				}
+				continue
+			}
+			if strings.EqualFold(word, "WHERE") ||
+				strings.EqualFold(word, "ORDER") ||
+				strings.EqualFold(word, "LIMIT") {
+				return nonEmptyUpdateSetClause(sqlText[setEnd:wordStart])
+			}
+		}
+	}
+
+	if setEnd < 0 {
+		return "", fmt.Errorf("UPDATE statement has no SET clause")
+	}
+	return nonEmptyUpdateSetClause(sqlText[setEnd:])
+}
+
+func nonEmptyUpdateSetClause(clause string) (string, error) {
+	clause = strings.TrimSpace(clause)
+	if clause == "" {
+		return "", fmt.Errorf("UPDATE statement has an empty SET clause")
+	}
+	return clause, nil
+}
+
+func skipSQLQuotedText(sqlText string, start int) int {
+	quote := sqlText[start]
+	for i := start + 1; i < len(sqlText); i++ {
+		if quote != '`' && sqlText[i] == '\\' {
+			i++
+			continue
+		}
+		if sqlText[i] != quote {
+			continue
+		}
+		if i+1 < len(sqlText) && sqlText[i+1] == quote {
+			i++
+			continue
+		}
+		return i + 1
+	}
+	return len(sqlText)
+}
+
+func skipSQLLineComment(sqlText string, start int) int {
+	for start < len(sqlText) && sqlText[start] != '\n' && sqlText[start] != '\r' {
+		start++
+	}
+	return start
+}
+
+func isSQLWordByte(ch byte) bool {
+	return ch >= 0x80 || ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' ||
+		ch >= '0' && ch <= '9' || ch == '_' || ch == '$'
 }
 
 func (w *Writer) fetchTableMeta(

@@ -178,6 +178,15 @@ func newWriterForTest(db *sql.DB) *Writer {
 	}
 }
 
+func TestNewWriterPreservesExecuteQuery(t *testing.T) {
+	query := "UPDATE sales.orders SET note = 'a;b' WHERE id > 0;"
+	w := newWriter(&conf.Config{ExecuteQuery: query})
+
+	if w.ExecuteSQL != query {
+		t.Fatalf("ExecuteSQL = %q, want original query %q", w.ExecuteSQL, query)
+	}
+}
+
 func enqueueOneBatchAndFinish(w *Writer) {
 	w.ProducerQueue <- &Producer{
 		WhereClause: "`id` = ?",
@@ -791,6 +800,41 @@ func TestWriterGetInfoFromTable_QualifiesExecuteTable(t *testing.T) {
 			table:     "orders",
 			query:     "UPDATE sales.orders SET status = 1 WHERE id > 0",
 			wantStart: "UPDATE `sales`.`orders` SET status = 1 WHERE ",
+		},
+		{
+			name:      "update schema contains set",
+			database:  "asset",
+			table:     "orders",
+			query:     "UPDATE asset.orders SET status = 1 WHERE id > 0",
+			wantStart: "UPDATE `asset`.`orders` SET status = 1 WHERE ",
+		},
+		{
+			name:      "update preserves operator spelling",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = left_part || right_part WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = left_part || right_part WHERE ",
+		},
+		{
+			name:      "update preserves semicolon in string literal",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET note = 'a;b' WHERE id > 0;",
+			wantStart: "UPDATE `sales`.`orders` SET note = 'a;b' WHERE ",
+		},
+		{
+			name:      "update ignores where in nested expression",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = (SELECT max(status) FROM archive WHERE archive.id = orders.id) WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = (SELECT max(status) FROM archive WHERE archive.id = orders.id) WHERE ",
+		},
+		{
+			name:      "update ignores keywords in literals and comments",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders /* SET fake */ SET note = 'WHERE and SET' /* WHERE fake */ WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET note = 'WHERE and SET' /* WHERE fake */ WHERE ",
 		},
 		{
 			name:      "escaped identifiers",

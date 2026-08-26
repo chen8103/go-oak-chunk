@@ -100,7 +100,7 @@ Flags:
                                        The lower the number, the shorter any locks are held, but the more operations required and the more total running time. (default 1000)
   -c, --config string                  config file path
       --cpuprofile file                write cpu profile to file
-  -d, --database string                Database name. Optional when --execute uses schema.table; if both are set, they must match
+  -d, --database string                Database name. Optional when --execute uses schema.table; if both are set, they must match exactly, including letter case
       --debug                          If debug_mode is true, print debug logs
       --dry-run                        Print sample SQL without executing
       --exclude-slaves string          which slaves should be include, include_slaves and exclude_slaves are mutually exclusive.
@@ -134,7 +134,7 @@ Flags:
       --yes                            Skip the large-table confirmation prompt
 ```
 
-> `--database` may be omitted when `--execute` uses a fully qualified `schema.table`. If both are provided, they must match or `goc` stops before opening the database connection.
+> `--database` may be omitted when `--execute` uses a fully qualified `schema.table`. If both are provided, they must match exactly, including letter case, or `goc` stops before opening the database connection.
 
 Sample:
 ```bash

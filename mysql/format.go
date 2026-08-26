@@ -16,6 +16,7 @@ func quoteIdentifier(name string) string {
 	return Quota + strings.ReplaceAll(name, Quota, Quota+Quota) + Quota
 }
 
+// QualifiedTableName returns a backtick-quoted schema-qualified table name.
 func QualifiedTableName(database, table string) string {
 	return quoteIdentifier(database) + "." + quoteIdentifier(table)
 }

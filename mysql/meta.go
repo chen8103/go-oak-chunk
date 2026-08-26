@@ -195,6 +195,7 @@ func handleColumnValue(scanArgs []interface{}, cols []string, keyCol string, tp 
 	}
 }
 
+// TableRef identifies the optional schema and table parsed from a DML target.
 type TableRef struct {
 	Schema string
 	Table  string
@@ -223,6 +224,7 @@ func TableMetaInfo(sql string) (string, error) {
 	return ref.Table, nil
 }
 
+// TargetTableMeta parses the target schema and table from UPDATE or DELETE SQL.
 func TargetTableMeta(sql string) (TableRef, error) {
 	tree, _, err := parser.New().ParseSQL(sql)
 	if err != nil {
