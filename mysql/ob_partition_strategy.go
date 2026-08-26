@@ -89,8 +89,7 @@ func (ps *OBPartitionStrategy) newCovering() *OBCoveringStrategy {
 
 // partitionTableRef returns "`db`.`table` PARTITION (`name`)".
 func (ps *OBPartitionStrategy) partitionTableRef(name string) string {
-	q := func(s string) string { return strings.ReplaceAll(s, "`", "``") }
-	return fmt.Sprintf("`%s`.`%s` PARTITION (`%s`)", q(ps.writer.Database), q(ps.writer.Table), q(name))
+	return fmt.Sprintf("%s PARTITION (%s)", QualifiedTableName(ps.writer.Database, ps.writer.Table), quoteIdentifier(name))
 }
 
 // Run implements ChunkStrategy.Run.

@@ -17,7 +17,7 @@ forced_chunking_column = ""
 host = "127.0.0.1"
 # TCP/IP port
 port = 3306
-# Database name (required unless table is fully qualified)
+# Database name. Optional when execute_query uses schema.table; if both are set, they must match.
 database = "goctest"
 # MySQL user
 user = "root"

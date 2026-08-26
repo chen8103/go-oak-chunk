@@ -112,16 +112,8 @@ func NewWriter(c *conf.Config) (*Writer, error) {
 func (w *Writer) preCheck(c *conf.Config) error {
 	var err error
 
-	// 获取database和table
-	//w.Table = c.Table
-	w.Database = c.Database
-	if w.Database == "" {
-		return fmt.Errorf("no database specified. specify Database with -d or --database")
-	}
-
-	w.Table, err = TableMetaInfo(w.ExecuteSQL)
-	if err != nil {
-		return fmt.Errorf("failed to parse table info: %w", err)
+	if err = w.resolveTarget(c); err != nil {
+		return fmt.Errorf("failed to resolve target table: %w", err)
 	}
 
 	// init mysql connect
@@ -143,6 +135,25 @@ func (w *Writer) preCheck(c *conf.Config) error {
 		return fmt.Errorf("sql parser failed, please check sql: %w", err)
 	}
 
+	return nil
+}
+
+func (w *Writer) resolveTarget(c *conf.Config) error {
+	ref, err := TargetTableMeta(w.ExecuteSQL)
+	if err != nil {
+		return fmt.Errorf("failed to parse table info: %w", err)
+	}
+
+	database, err := resolveTargetDatabase(c.Database, ref.Schema)
+	if err != nil {
+		return err
+	}
+
+	w.Database = database
+	w.Table = ref.Table
+	// Config is shared with the task and slave-lag paths. Normalize it once so
+	// every connection and status message uses the same resolved database.
+	c.Database = database
 	return nil
 }
 
@@ -335,7 +346,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 		node.Accept(v)
 		whereNode = n.Where
 
-		w.ExecuteSQL = fmt.Sprintf("DELETE FROM `%s` WHERE ", w.Table)
+		w.ExecuteSQL = fmt.Sprintf("DELETE FROM %s WHERE ", QualifiedTableName(w.Database, w.Table))
 	case *ast.UpdateStmt:
 		w.SqlType = "Update"
 		node.Accept(v)
@@ -343,7 +354,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 		re := regexp.MustCompile(`set.*where|SET.*WHERE|set.*WHERE|SET.*where`)
 		sub := re.FindString(c.ExecuteQuery)
-		w.ExecuteSQL = fmt.Sprintf("UPDATE `%s` %s ", w.Table, sub)
+		w.ExecuteSQL = fmt.Sprintf("UPDATE %s %s ", QualifiedTableName(w.Database, w.Table), sub)
 	default:
 		return fmt.Errorf("please confirm sql type is update or delete")
 	}
@@ -387,7 +398,7 @@ func (w *Writer) getInfoFromTable(c *conf.Config) error {
 
 	// Second find primary/unique index which can be used
 	// check for column in Table meta
-	ns := fmt.Sprintf("`%s`.`%s`", w.Database, w.Table)
+	ns := QualifiedTableName(w.Database, w.Table)
 
 	if c.TiDBRowID {
 		// _tidb_rowid 模式不依赖 PK/UK, 跳过唯一键解析;

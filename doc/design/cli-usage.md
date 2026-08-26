@@ -90,7 +90,7 @@ go run ./cmd/go-oak-chunk run --help
 | `-P, --port` | int / `3306` | 否 | MySQL 端口 | |
 | `-u, --user` | string / `root` | 否 | MySQL 用户 | |
 | `-p, --password` | string / 空 | 否 | MySQL 密码 | |
-| `-d, --database` | string / 空 | **是（当前实现）** | 目标库名 | 虽帮助文案写“除非全限定表名”，但当前实现仍要求必填 |
+| `-d, --database` | string / 空 | SQL 未使用 `schema.table` 时必填 | 目标库名 | 与 SQL schema 同时提供时必须一致 |
 | `--txn-size` | int64 / `1000` | 否 | 每个事务最多处理行数 | 控制单事务体量 |
 | `--sleep` | int64 / `0` | 否 | chunk 间 sleep（毫秒） | 单位是 **毫秒** |
 | `--noConsiderLag` | bool / `false` | 否 | 是否忽略 lag 放大逻辑 | `true` 时 sleep 不会被大幅拉高 |
@@ -494,7 +494,8 @@ TiDB 专属能力：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主�
 | `query to execute must be provided` | 未传 `--execute` 或配置缺失 | 补齐 SQL |
 | `chunk size must be nonnegative` | `chunk-size < 0` | 改为 `>=0` |
 | `--include-slaves and --exclude-slaves are mutually exclusive` | 两个参数同时设置 | 保留一个 |
-| `no database specified` | 未设置 `--database`/`database` | 显式传库名 |
+| `no database specified` | 未设置 `--database`/`database`，SQL 也未使用 `schema.table` | 显式传库名或使用全限定表名 |
+| `database mismatch` | `--database`/`database` 与 SQL schema 不一致 | 统一为同一个库名；工具会在连接前停止 |
 | `table xxx does not exist` | 库名或表名错误 | 检查 `database` 与 SQL |
 | `please confirm sql type is update or delete` | SQL 不是 Update/Delete | 改为支持类型 |
 | `can't find any index which is primary or unique key` | 目标表无主键/唯一键 | 增加唯一键或改表 |
@@ -518,7 +519,7 @@ TiDB 专属能力：用隐藏行句柄 `_tidb_rowid` 做分块键，让**无主�
 
 ## 16. 与当前实现相关的注意事项（避免踩坑）
 
-1. 帮助文案写 `database` 在全限定表名时可省略，但当前实现仍要求提供 `database`
+1. SQL 使用 `schema.table` 时可省略 `database`；两者同时提供时必须一致
 2. `sleep` 单位是 **毫秒**，不是秒
 3. 配置文件键是 `forced_chunking_column`，不是 `force_chunking_column`
 4. CLI 无配置文件时会自动把 `correct` 设为 `50`；配置文件模式建议显式给 `correct = 50`

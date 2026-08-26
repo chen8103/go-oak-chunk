@@ -188,7 +188,7 @@ func initRun() {
 	runCmd.Flags().Int64Var(&sleep, "sleep", 0, "Number of milliseconds to sleep between chunks.")
 	runCmd.Flags().BoolVar(&noConsiderLag, "noConsiderLag", false, "If true: sleep value will not be overshoot\nfalse: if slave lag is very high, sleep will be overshoot")
 	//runCmd.Flags().BoolVar(&skipLockTables, "skip-lock-tables", false, "Do not issue a LOCK TABLES READ. May be required when using queries within --start-with or --end-with")
-	runCmd.Flags().StringVarP(&database, "database", "d", "", "Database name (required unless table is fully qualified)")
+	runCmd.Flags().StringVarP(&database, "database", "d", "", "Database name. Optional when --execute uses schema.table; if both are set, they must match")
 	runCmd.Flags().Int64Var(&txnSize, "txn-size", 1000, "Number of rows per transaction.")
 	runCmd.Flags().Int64Var(&maxLag, "max-lag", 0, "Pause chunk dml if the slave reach Threshold.")
 	runCmd.Flags().BoolVar(&debug, "debug", false, "If debug_mode is true, print debug logs")

@@ -143,7 +143,7 @@ func main() {
 | 字段 | 类型 | 默认/建议 | 说明 |
 |---|---|---|---|
 | `ExecuteQuery` | `string` | 必填 | 单条 `UPDATE/DELETE` SQL |
-| `Database` | `string` | 必填 | 当前实现要求非空 |
+| `Database` | `string` | SQL 未使用 `schema.table` 时必填 | 与 SQL schema 同时提供时必须一致 |
 | `Host` | `string` | 必填 | 主库地址 |
 | `Port` | `int` | 必填 | 主库端口 |
 | `User` | `string` | 必填 | 用户名 |

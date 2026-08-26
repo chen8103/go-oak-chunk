@@ -82,7 +82,7 @@ func (ocs *OBCoveringStrategy) Name() string {
 // defaultTableRef 返回非分区路径的表引用 "`db`.`table`"。
 // 分区并发路径会改用 "`db`.`table` PARTITION (`name`)"。
 func (ocs *OBCoveringStrategy) defaultTableRef() string {
-	return fmt.Sprintf("`%s`.`%s`", ocs.writer.Database, ocs.writer.Table)
+	return QualifiedTableName(ocs.writer.Database, ocs.writer.Table)
 }
 
 // Run implements ChunkStrategy.Run.

@@ -143,7 +143,7 @@ func main() {
 | Field | Type | Default/recommendation | Description |
 |---|---|---|---|
 | `ExecuteQuery` | `string` | Required | Single-statement `UPDATE/DELETE` SQL |
-| `Database` | `string` | Required | The current implementation requires a non-empty value |
+| `Database` | `string` | Required unless SQL uses `schema.table` | Must match the SQL schema when both are provided |
 | `Host` | `string` | Required | Primary address |
 | `Port` | `int` | Required | Primary port |
 | `User` | `string` | Required | Username |

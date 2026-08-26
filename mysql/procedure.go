@@ -58,7 +58,7 @@ func (p *Procedure) BuildSQL(producer chan *Producer) error {
 	keyColumns := strings.Join(keyList, ",")
 	conditions := BuildSelectWhereClause(p.unqKeys)
 
-	ns := fmt.Sprintf("`%s`.`%s`", p.database, p.table)
+	ns := QualifiedTableName(p.database, p.table)
 	firstSql := fmt.Sprintf(vars.FirstSQL, keyColumns, ns, p.originWhereClause)
 	nextSql := firstSql
 	/*

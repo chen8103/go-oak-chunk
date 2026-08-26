@@ -770,6 +770,57 @@ func TestWriterGetInfoFromTable_DataSourceFlow(t *testing.T) {
 	}
 }
 
+func TestWriterGetInfoFromTable_QualifiesExecuteTable(t *testing.T) {
+	tests := []struct {
+		name      string
+		database  string
+		table     string
+		query     string
+		wantStart string
+	}{
+		{
+			name:      "delete",
+			database:  "sales",
+			table:     "orders",
+			query:     "DELETE FROM sales.orders WHERE id > 0",
+			wantStart: "DELETE FROM `sales`.`orders` WHERE ",
+		},
+		{
+			name:      "update",
+			database:  "sales",
+			table:     "orders",
+			query:     "UPDATE sales.orders SET status = 1 WHERE id > 0",
+			wantStart: "UPDATE `sales`.`orders` SET status = 1 WHERE ",
+		},
+		{
+			name:      "escaped identifiers",
+			database:  "sales`archive",
+			table:     "order`items",
+			query:     "DELETE FROM `sales``archive`.`order``items` WHERE id > 0",
+			wantStart: "DELETE FROM `sales``archive`.`order``items` WHERE ",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db, _ := newGetInfoTestDB(t, getInfoPlan{version: "8.0.36"})
+			w := &Writer{
+				MysqlClient: db,
+				ExecuteSQL:  tt.query,
+				Database:    tt.database,
+				Table:       tt.table,
+			}
+
+			if err := w.getInfoFromTable(&conf.Config{ExecuteQuery: tt.query}); err != nil {
+				t.Fatalf("getInfoFromTable returned err: %v", err)
+			}
+			if !strings.HasPrefix(w.ExecuteSQL, tt.wantStart) {
+				t.Fatalf("ExecuteSQL = %q, want prefix %q", w.ExecuteSQL, tt.wantStart)
+			}
+		})
+	}
+}
+
 func TestWriterGetInfoFromTable_FreezeNowUsesDatabaseTime(t *testing.T) {
 	db, state := newGetInfoTestDB(t, getInfoPlan{
 		version:      "8.0.36",
