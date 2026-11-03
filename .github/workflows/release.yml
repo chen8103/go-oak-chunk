@@ -1,0 +1,129 @@
+# 推送 v3.* tag 时构建六个平台的归档并发布 GitHub Release。
+# pull_request / workflow_dispatch 只做 dry-run：构建、生成 checksums、上传 workflow artifact，不创建 Release。
+name: Release
+
+on:
+  push:
+    tags:
+      - "v3.*"
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/scripts/build-release-assets.sh"
+      - ".github/scripts/release-notes.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: 设置 Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.26.2"
+          cache: true
+
+      - name: 确定版本与是否发布
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          publish=false
+          version=dryrun
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == refs/tags/v3.* ]]; then
+            if [[ ! "${GITHUB_REF_NAME}" =~ ^v3[.][A-Za-z0-9._+-]+$ ]]; then
+              echo "::error::tag 名含有配方不允许的字符，拒绝发布"
+              exit 1
+            fi
+            publish=true
+            version="${GITHUB_REF_NAME}"
+          elif [[ "${GITHUB_REF}" == refs/tags/v3.* && "${GITHUB_REF_NAME}" =~ ^v3[.][A-Za-z0-9._+-]+$ ]]; then
+            version="${GITHUB_REF_NAME}"
+          fi
+          echo "publish=${publish}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: 拒绝覆盖已有 Release
+        if: steps.ver.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: "1"
+        run: |
+          set -euo pipefail
+          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::已存在 Release ${GITHUB_REF_NAME}，拒绝覆盖已有资产"
+            exit 1
+          fi
+
+      - name: 构建归档与 checksums
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          out="${RUNNER_TEMP}/assets"
+          bash .github/scripts/build-release-assets.sh "${RELEASE_VERSION}" "${out}"
+          echo "ASSET_DIR=${out}" >> "${GITHUB_ENV}"
+          echo "===== files ====="
+          ls -l "${out}"
+          echo "===== checksums.txt ====="
+          cat "${out}/checksums.txt"
+
+      - name: 上传 dry-run 产物
+        if: steps.ver.outputs.publish != 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-assets-dryrun
+          path: ${{ runner.temp }}/assets
+          if-no-files-found: error
+          overwrite: false
+
+      - name: 生成发布说明
+        if: steps.ver.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash .github/scripts/release-notes.sh \
+            "${GITHUB_REF_NAME}" \
+            "${RUNNER_TEMP}/release-title.txt" \
+            "${RUNNER_TEMP}/release-notes.md"
+
+      - name: 创建 Release
+        if: steps.ver.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: "1"
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "::error::已存在 Release ${tag}，拒绝覆盖已有资产"
+            exit 1
+          fi
+          title=$(tr -d '\r' < "${RUNNER_TEMP}/release-title.txt")
+          title=${title//$'\n'/}
+          gh release create "${tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --title "${title}" \
+            --notes-file "${RUNNER_TEMP}/release-notes.md" \
+            "${ASSET_DIR}/goc_${tag}_darwin_amd64.tar.gz" \
+            "${ASSET_DIR}/goc_${tag}_darwin_arm64.tar.gz" \
+            "${ASSET_DIR}/goc_${tag}_linux_amd64.tar.gz" \
+            "${ASSET_DIR}/goc_${tag}_linux_arm64.tar.gz" \
+            "${ASSET_DIR}/goc_${tag}_windows_amd64.zip" \
+            "${ASSET_DIR}/goc_${tag}_windows_arm64.zip" \
+            "${ASSET_DIR}/checksums.txt"
